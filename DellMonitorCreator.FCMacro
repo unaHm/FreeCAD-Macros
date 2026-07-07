@@ -1,0 +1,135 @@
+import FreeCAD as App
+import Part
+from FreeCAD import Base
+import math
+
+# ==============================================================================
+# --- CONFIGURATION PARAMETERS (Page 13 Physical Specifications) ---
+# ==============================================================================
+MODEL = "P2214H"  # Change to "P2414H" to auto-scale workspace dimensions
+
+if MODEL == "P2414H":
+    MON_WIDTH  = 565.6   
+    MON_HEIGHT = 335.1   
+    MON_DEPTH  = 47.0    
+else:
+    MON_WIDTH  = 512.7   
+    MON_HEIGHT = 304.4   
+    MON_DEPTH  = 46.3    
+
+# --- GEOMETRIC PROFILES (Page 9 Reference Views) ---
+BEZEL_WIDTH = 18.0       # Front bezel mask framework boundary width
+SCREEN_INSET = 2.0       # Recess depth of active TFT glass panel
+CORNER_RADIUS = 6.0      # Fillet blend radius for outer corners
+
+# Side Profile Steps (Page 9 Side View)
+BEZEL_FLAT_DEPTH = 11.5  # Straight front outer side-wall band before curve begins
+BREAKLINE_DEPTH  = 17.5  # Chassis depth where the sweeping rear bulge begins
+
+# Rear Flat VESA Platform
+VESA_PLATE_W = 140.0     # Flat rectangular width preserved for flush mount mating
+VESA_PLATE_H = 140.0     # Flat rectangular height preserved for flush mount mating
+VESA_SPACING = 100.0     # Standard VESA MIS-D 100x100mm mechanical grid
+
+# Rear Port Bay Cutout (Page 9 Shroud Interface)
+IO_WIDTH = 240.0         
+IO_HEIGHT = 65.0         
+IO_DEPTH = 22.0          
+
+# ==============================================================================
+# --- CONSTRUCT ENVIRONMENT ---
+# ==============================================================================
+doc_name = f"Dell_{MODEL}_True_Convex"
+doc = App.newDocument(doc_name)
+
+# Zero-plane references: Front screen face sits at Z = 0. Casing moves down -Z.
+Z_FRONT       = 0.0
+Z_BREAKLINE   = -BEZEL_FLAT_DEPTH
+Z_BACK_CURVE  = -BREAKLINE_DEPTH
+Z_VESA_PLATE  = -MON_DEPTH
+
+# ------------------------------------------------------------------------------
+# 1. CONSTRUCT CHASSIS VAULT (True Convex Multi-Profile Constructive Loft)
+# ------------------------------------------------------------------------------
+def make_rounded_wire(w, h, r, z_pos):
+    """Generates a closed, rounded parametric rectangle wire profile."""
+    dx = w / 2.0 - r
+    dy = h / 2.0 - r
+    
+    # Define corner vertex coordinate points
+    p1 = App.Base.Vector(-dx, -h/2.0, z_pos)
+    p2 = App.Base.Vector( dx, -h/2.0, z_pos)
+    p3 = App.Base.Vector( w/2.0, -dy, z_pos)
+    p4 = App.Base.Vector( w/2.0,  dy, z_pos)
+    p5 = App.Base.Vector( dx,  h/2.0, z_pos)
+    p6 = App.Base.Vector(-dx,  h/2.0, z_pos)
+    p7 = App.Base.Vector(-w/2.0,  dy, z_pos)
+    p8 = App.Base.Vector(-w/2.0, -dy, z_pos)
+    
+    # Construct paths
+    seg1 = Part.LineSegment(p1, p2).toShape()
+    seg2 = Part.Arc(p2, App.Base.Vector(w/2.0, -h/2.0 + (r * (1 - math.sin(math.pi/4))), z_pos), p3).toShape()
+    seg3 = Part.LineSegment(p3, p4).toShape()
+    seg4 = Part.Arc(p4, App.Base.Vector(dx + (r * math.cos(math.pi/4)), dy + (r * math.sin(math.pi/4)), z_pos), p5).toShape()
+    seg5 = Part.LineSegment(p5, p6).toShape()
+    seg6 = Part.Arc(p6, App.Base.Vector(-dx - (r * math.cos(math.pi/4)), dy + (r * math.sin(math.pi/4)), z_pos), p7).toShape()
+    seg7 = Part.LineSegment(p7, p8).toShape()
+    seg8 = Part.Arc(p8, App.Base.Vector(-w/2.0, -dy - (r * (1 - math.sin(math.pi/4))), z_pos), p1).toShape()
+    
+    return Part.Wire([seg1, seg2, seg3, seg4, seg5, seg6, seg7, seg8])
+
+# Profile A: Outer front screen bezel perimeter
+wire_front = make_rounded_wire(MON_WIDTH, MON_HEIGHT, CORNER_RADIUS, Z_FRONT)
+
+# Profile B: Mid-body transition profile at the step edge
+wire_break = make_rounded_wire(MON_WIDTH, MON_HEIGHT, CORNER_RADIUS, Z_BREAKLINE)
+
+# Profile C: Transitional rear wire matching the sweeping breakline profile boundary
+wire_rear_curve = make_rounded_wire(MON_WIDTH, MON_HEIGHT, CORNER_RADIUS, Z_BACK_CURVE)
+
+# Profile D: Flat center VESA landing pad profile (Rearmost face plane)
+wire_vesa = make_rounded_wire(VESA_PLATE_W, VESA_PLATE_H, 2.0, Z_VESA_PLATE)
+
+# Generate true convex sweeping loft directly into the solid chassis object
+chassis = Part.makeLoft([wire_front, wire_break, wire_rear_curve, wire_vesa], True, False)
+
+# ------------------------------------------------------------------------------
+# 2. SUBTRACTIVE ACTIVE PANEL RECESSED SCREEN (Front Profile View)
+# ------------------------------------------------------------------------------
+screen_w = MON_WIDTH - (BEZEL_WIDTH * 2)
+screen_h = MON_HEIGHT - (BEZEL_WIDTH * 2)
+screen_cut = Part.makeBox(screen_w, screen_h, SCREEN_INSET + 0.1)
+screen_cut.translate(App.Base.Vector(-screen_w/2.0, -screen_h/2.0, Z_FRONT - SCREEN_INSET))
+chassis = chassis.cut(screen_cut)
+
+# ------------------------------------------------------------------------------
+# 3. SUBTRACTIVE REAR I/O CONNECTOR POCKET (Page 9 Shroud Interface View)
+# ------------------------------------------------------------------------------
+io_cut = Part.makeBox(IO_WIDTH, IO_HEIGHT, IO_DEPTH + 0.1)
+io_cut.translate(App.Base.Vector(-IO_WIDTH/2.0, -(MON_HEIGHT * 0.18) - (IO_HEIGHT/2.0), Z_VESA_PLATE - 0.05))
+chassis = chassis.cut(io_cut)
+
+# ------------------------------------------------------------------------------
+# 4. SUBTRACTIVE VESA 100x100mm MECHANICAL HARDWARE ARRAY
+# ------------------------------------------------------------------------------
+half_v = VESA_SPACING / 2.0
+for x_sign in [-1, 1]:
+    for y_sign in [-1, 1]:
+        hole_x = x_sign * half_v
+        hole_y = y_sign * half_v
+        
+        bolt_center = App.Base.Vector(hole_x, hole_y, Z_VESA_PLATE - 0.1)
+        bolt_dir = App.Base.Vector(0, 0, 1)
+        
+        # 4.5mm diameter standard clearance holes passing deep through back casing
+        hole_cyl = Part.makeCylinder(2.25, MON_DEPTH + 0.2, bolt_center, bolt_dir)
+        chassis = chassis.cut(hole_cyl)
+
+# ==============================================================================
+# --- RENDER OUTPUT STAGE ---
+# ==============================================================================
+mesh_obj = doc.addObject("Part::Feature", f"Dell_{MODEL}_Convex_Monitor")
+mesh_obj.Shape = chassis
+
+doc.recompute()
+App.Console.PrintMessage(f"Successfully rendered true convex Dell {MODEL} monitor chassis architecture.\n")

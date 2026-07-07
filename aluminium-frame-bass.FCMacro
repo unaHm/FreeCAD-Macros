@@ -1,0 +1,1336 @@
+import FreeCAD as App
+import Part
+import importSVG
+import re
+import os
+import Draft
+import gc  # Crucial for manual garbage collection in heavy loops
+
+doc = App.activeDocument()
+if not doc:
+    doc = App.newDocument("SwainyBass_Assembly")
+
+existing_objects = set(doc.Objects)
+
+# ==========================================
+# --- 0. FORCE SMOOTHNESS & 1:1 SCALING ----
+# ==========================================
+
+# Access FreeCAD's user parameters to force clean, professional SVG import settings.
+# This eliminates low-polygon jaggedness and scale-mismatch coordinate explosions.
+draft_prefs = App.ParamGet("User parameter:BaseApp/Preferences/Mod/Draft")
+draft_prefs.SetFloat("importSVGScale", 1.0)        # Force an absolute 1:1 scale (1 unit in SVG = 1mm in FreeCAD)
+draft_prefs.SetFloat("svgDiscretization", 0.05)    # Set curve discretization to 0.05mm for ultra-smooth rendering
+
+# Toggle handedness (True for Left-Handed, False for Right-Handed)
+is_left_handed = True  
+side_multiplier = -1 if is_left_handed else 1
+
+# File paths pointing to your SVG assets
+FILES = {
+    "body_contour": "/home/dan/Downloads/swainybass-2026-07-body.svg",
+    "headstock": "/home/dan/Downloads/swainybass-2026-06-headstock-complete.svg",
+    "cavity": "/home/dan/Downloads/swainybass-2026-06-cavity.svg",
+    "cavity_flange": "/home/dan/Downloads/swainybass-2026-06-cavityflange.svg",
+    "pot_holes": "/home/dan/Downloads/swainybass-2026-06-through-holes.svg"
+}
+
+# Physical dimensions of the instrument
+scale_length = 864.0
+epsilon = 0.005 
+
+# ==========================================
+# --- 1. GEOMETRY HELPER FUNCTIONS ---------
+# ==========================================
+
+def get_circle_properties(shape):
+    """Robust circle analyzer to extract exact radius and center of circular elements."""
+    for edge in shape.Edges:
+        try:
+            curve = edge.Curve
+            if hasattr(curve, "Center") and hasattr(curve, "Radius"):
+                curve_name = type(curve).__name__
+                if "Circle" in curve_name or "ArcOfCircle" in curve_name or curve_name in ["Circle", "GeomCircle", "ArcOfCircle", "GeomArcOfCircle"]:
+                    return curve.Radius, curve.Center
+        except Exception:
+            pass
+    # Fallback to bounding box measurements
+    bbox = shape.BoundBox
+    cx = (bbox.XMax + bbox.XMin) / 2.0
+    cy = (bbox.YMax + bbox.YMin) / 2.0
+    rx = (bbox.XMax - bbox.XMin) / 2.0
+    ry = (bbox.YMax - bbox.YMin) / 2.0
+    radius = (rx + ry) / 2.0
+    return radius, App.Vector(cx, cy, bbox.Center.z)
+
+
+def create_svg_solid(filepath, thickness, name, doc):
+    """Imports an SVG, parses it using FreeCAD's robust Draft Sketch engine,
+    extrudes it to a clean manifold solid, copies the shape in-memory, and
+    immediately cleans up the document tree to keep RAM and memory pristine."""
+    if not os.path.exists(filepath):
+        App.Console.PrintWarning(f"File not found at {filepath}\n")
+        return None
+
+    old_objs = set(doc.Objects)
+    try:
+        importSVG.insert(filepath, doc.Name)
+        doc.recompute()
+    except Exception as e:
+        App.Console.PrintError(f"Failed to import {name} SVG: {str(e)}\n")
+        return None
+    
+    new_objs = [obj for doc_obj in [doc] for obj in doc_obj.Objects if obj not in old_objs]
+    if not new_objs:
+        App.Console.PrintError(f"No valid paths found for {name}\n")
+        return None
+
+    in_memory_shape = None
+    try:
+        # Convert raw SVG shapes into a parametric Draft Sketch (robust nesting of outer paths & inner holes)
+        if hasattr(Draft, "make_sketch"):
+            sketch = Draft.make_sketch(new_objs, autoconstraints=True)
+        else:
+            sketch = Draft.makeSketch(new_objs, autoconstraints=True)
+            
+        doc.recompute()
+        
+        # Create a temporary extrusion to resolve nesting into a clean, manifold solid
+        extrude = doc.addObject("Part::Extrusion", "TempExtrude")
+        extrude.Base = sketch
+        extrude.Dir = App.Vector(0, 0, thickness)
+        extrude.Solid = True
+        doc.recompute()
+        
+        # Copy the clean shape to memory
+        in_memory_shape = extrude.Shape.copy()
+        
+    except Exception as e:
+        App.Console.PrintError(f"Failed to build solid for {name} using Draft sketch: {str(e)}\n")
+        in_memory_shape = None
+
+    # Cleanup ALL temporary objects (imported paths, sketch, extrusion) immediately
+    all_new_objs = [obj for doc_obj in [doc] for obj in doc_obj.Objects if obj not in old_objs]
+    for obj in all_new_objs:
+        try:
+            doc.removeObject(obj.Name)
+        except Exception:
+            pass
+    doc.recompute()
+    
+    return in_memory_shape
+
+
+def create_fretboard_radiused_wire(x, y_center, width, thickness=7.0, z_bottom=17.0, radius=500.0):
+    """Creates a beautifully crowned profile wire for the fretboard using a 500mm radius."""
+    import math
+    ry = width / 2.0
+    z_peak = z_bottom + thickness
+    z_center_circle = z_peak - radius
+    
+    # Calculate drops at the tapered edges
+    z_edge = z_center_circle + math.sqrt(radius**2 - ry**2)
+    
+    # Define circular arc coordinates
+    p_start = App.Vector(x, y_center - ry, z_edge)
+    p_mid = App.Vector(x, y_center, z_peak)
+    p_end = App.Vector(x, y_center + ry, z_edge)
+    
+    p_bot_right = App.Vector(x, y_center + ry, z_bottom)
+    p_bot_left = App.Vector(x, y_center - ry, z_bottom)
+    
+    # Build geometry wire
+    arc = Part.Arc(p_start, p_mid, p_end)
+    arc_edge = arc.toShape()
+    
+    edge_right = Part.makeLine(p_end, p_bot_right)
+    edge_bottom = Part.makeLine(p_bot_right, p_bot_left)
+    edge_left = Part.makeLine(p_bot_left, p_start)
+    
+    wire = Part.Wire([arc_edge, edge_right, edge_bottom, edge_left])
+    return wire
+
+
+def create_curved_slot_cutter(x, y_center, width, slot_width=0.6, slot_depth=1.5, radius=500.0):
+    """Generates a concentric curved cylinder solid to cut slots with uniform luthier-depth."""
+    import math
+    ry = (width + 10.0) / 2.0  # Overshoot edges cleanly
+    z_center_circle = 24.0 - radius
+    
+    # Outer radius (overshoots crown to clear wood) and inner slot-bed radius
+    r_top = radius + 1.0  
+    r_bot = radius - slot_depth  
+    
+    z_top_edge = z_center_circle + math.sqrt(r_top**2 - ry**2)
+    z_bot_edge = z_center_circle + math.sqrt(r_bot**2 - ry**2)
+    
+    p_top_start = App.Vector(x, y_center - ry, z_top_edge)
+    p_top_mid = App.Vector(x, y_center, z_center_circle + r_top)
+    p_top_end = App.Vector(x, y_center + ry, z_top_edge)
+    
+    p_bot_start = App.Vector(x, y_center - ry, z_bot_edge)
+    p_bot_mid = App.Vector(x, y_center, z_center_circle + r_bot)
+    p_bot_end = App.Vector(x, y_center + ry, z_bot_edge)
+    
+    arc_top = Part.Arc(p_top_start, p_top_mid, p_top_end).toShape()
+    arc_bot = Part.Arc(p_bot_end, p_bot_mid, p_bot_start).toShape()
+    
+    edge_right = Part.makeLine(p_top_end, p_bot_end)
+    edge_left = Part.makeLine(p_bot_start, p_top_start)
+    
+    wire = Part.Wire([arc_top, edge_right, arc_bot, edge_left])
+    face = Part.Face(wire)
+    solid = face.extrude(App.Vector(slot_width, 0, 0))
+    solid.translate(App.Vector(-slot_width / 2.0, 0, 0))
+    return solid
+
+
+def create_ramp_wire(x, y_center, width, thickness=8.0, z_bottom=11.0, radius=500.0):
+    """Creates a beautifully crowned profile wire for the finger ramp using a 500mm radius."""
+    import math
+    ry = width / 2.0
+    z_peak = z_bottom + thickness
+    z_center_circle = z_peak - radius
+    
+    # Calculate drop-off at the edges of the ramp
+    z_edge = z_center_circle + math.sqrt(radius**2 - ry**2)
+    
+    # Define circular arc coordinates
+    p_start = App.Vector(x, y_center - ry, z_edge)
+    p_mid = App.Vector(x, y_center, z_peak)
+    p_end = App.Vector(x, y_center + ry, z_edge)
+    
+    p_bot_right = App.Vector(x, y_center + ry, z_bottom)
+    p_bot_left = App.Vector(x, y_center - ry, z_bottom)
+    
+    # Build geometry wire
+    arc = Part.Arc(p_start, p_mid, p_end)
+    arc_edge = arc.toShape()
+    
+    edge_right = Part.makeLine(p_end, p_bot_right)
+    edge_bottom = Part.makeLine(p_bot_right, p_bot_left)
+    edge_left = Part.makeLine(p_bot_left, p_start)
+    
+    wire = Part.Wire([arc_edge, edge_right, edge_bottom, edge_left])
+    return wire
+
+
+# ==========================================
+# --- 2. IMPORT HEADSTOCK & tuner holes ----
+# ==========================================
+
+try:
+    importSVG.insert(FILES["headstock"], doc.Name)
+    doc.recompute() 
+except Exception as e:
+    App.Console.PrintError(f"Failed to import Headstock SVG: {str(e)}\n") 
+
+new_objects = [obj for doc_obj in [doc] for obj in doc_obj.Objects if obj not in existing_objects] 
+svg_geometry = [obj for obj in new_objects if hasattr(obj, 'Shape') and not obj.Shape.isNull()] 
+
+if not svg_geometry:
+    App.Console.PrintError("Error: No valid SVG geometry shapes found for Headstock.\n") 
+else:
+    App.Console.PrintMessage(f"Found {len(svg_geometry)} SVG elements for Headstock. Processing geometries...\n") 
+
+    try:
+        headstock_contour = None
+        tuner_holes = []
+        max_hs_area = 0.0
+
+        for obj in svg_geometry:
+            if hasattr(obj, "Shape") and not obj.Shape.isNull():
+                bbox = obj.Shape.BoundBox
+                area = (bbox.XMax - bbox.XMin) * (bbox.YMax - bbox.YMin)
+                if area > max_hs_area:
+                    if headstock_contour:
+                        tuner_holes.append(headstock_contour)
+                    max_hs_area = area
+                    headstock_contour = obj
+                else:
+                    tuner_holes.append(obj)
+
+        if headstock_contour:
+            hs_outer_shape = headstock_contour.Shape
+            if hasattr(hs_outer_shape, "OuterWire") and hs_outer_shape.OuterWire:
+                hs_outer_wire = hs_outer_shape.OuterWire
+            elif len(hs_outer_shape.Wires) > 0:
+                hs_outer_wire = hs_outer_shape.Wires[0]
+            else:
+                hs_outer_wire = hs_outer_shape
+                
+            hs_outer_face = Part.Face(hs_outer_wire)
+            hs_solid = hs_outer_face.extrude(App.Vector(0, 0, 17.0))
+            
+            # Subtractive cylinders for tuner pegs
+            hs_cutters = []
+            for hole_obj in tuner_holes:
+                try:
+                    r, center = get_circle_properties(hole_obj.Shape)
+                    cyl = Part.makeCylinder(r, 37.0, App.Vector(center.x, center.y, -10.0), App.Vector(0, 0, 1))
+                    hs_cutters.append(cyl)
+                except Exception as e:
+                    App.Console.PrintWarning(f"Failed to process tuner hole: {str(e)}\n")
+                    
+            if hs_cutters:
+                hs_cuts_compound = Part.makeCompound(hs_cutters)
+                hs_solid = hs_solid.cut(hs_cuts_compound)
+
+            bounds = hs_solid.BoundBox 
+            left_edge_x = bounds.XMin 
+            center_y = bounds.Center.y 
+
+            target_x = scale_length - left_edge_x 
+            target_y = 0.0 - center_y
+
+            headstock_shape = hs_solid.copy()
+            headstock_shape.translate(App.Vector(target_x, target_y, 0))
+            
+            try:
+                shell = Part.Shell(headstock_shape.Faces)
+                solid = Part.Solid(shell)
+                if solid.Volume > 0:
+                    headstock_shape = solid
+                    App.Console.PrintMessage("Successfully healed headstock into a solid manifold.\n")
+            except Exception as e:
+                App.Console.PrintWarning(f"Could not force solid manifold: {str(e)}\n")
+
+        # Cleanup imported raw vectors immediately to keep tree and RAM completely clean
+        for obj in svg_geometry:
+            try:
+                doc.removeObject(obj.Name)
+            except Exception:
+                pass
+            
+    except Exception as e:
+        App.Console.PrintError(f"Failed to process headstock geometry: {str(e)}\n") 
+
+
+# ==========================================
+# --- 3. BRIDGE BLOCK & CONNECTING RODS ----
+# ==========================================
+
+block_x = -30.0
+block_y = -55.0
+block_z = -19.0
+bridge_shape = Part.makeBox(60.0, 110.0, 30.0, App.Vector(block_x, block_y, block_z))
+
+# 12 Tap Holes for M5 Bolts (2 rows of 6, 25mm Deep)
+node_radius = 2.1
+hole_depth = 25.0   
+hole_z_start = 11.0 
+
+x_positions = [-15.0, 15.0]  
+y_positions = [-45.0, -27.0, -9.0, 9.0, 27.0, 45.0]  
+
+hole_shapes = [] 
+for x in x_positions: 
+    for y in y_positions: 
+        hole_shapes.append(Part.makeCylinder(node_radius, hole_depth, App.Vector(x, y, hole_z_start), App.Vector(0, 0, -1)))
+
+cutters_shape = Part.makeCompound(hole_shapes)
+bridge_block_raw_shape = bridge_shape.cut(cutters_shape)
+
+span_start_x = 30.0  
+span_end_x = scale_length   
+
+headstock_top_y = 30.0   
+headstock_bottom_y = -30.0 
+
+if 'headstock_shape' in locals():
+    left_face_y_coords = []
+    for vertex in headstock_shape.Vertexes: 
+        if abs(vertex.Point.x - span_end_x) < epsilon: 
+            left_face_y_coords.append(vertex.Point.y) 
+            
+    if left_face_y_coords: 
+        headstock_top_y = max(left_face_y_coords) 
+        headstock_bottom_y = min(left_face_y_coords) 
+
+# Carbon Fiber Tube Routing Channels
+radius = 10.5 / 2.0 
+embed_depth_bridge = 80.0  
+embed_depth_headstock = 25.0  
+
+bridge_center_z = 3.0 
+headstock_center_z = 9.0 
+
+bridge_inset_top_y = 20.0 
+bridge_inset_bottom_y = -20.0 
+
+headstock_inset_top_y = headstock_top_y - 20.0 
+headstock_inset_bottom_y = headstock_bottom_y + 20.0 
+
+# Top rod routing channel
+p_start1 = App.Vector(span_start_x, bridge_inset_top_y, bridge_center_z) 
+p_end1 = App.Vector(span_end_x, headstock_inset_top_y, headstock_center_z) 
+dir_vector1 = p_end1 - p_start1 
+span_length1 = dir_vector1.Length
+u1 = dir_vector1 / span_length1
+
+p_start1_extended = p_start1 - u1 * embed_depth_bridge
+length_extended1 = span_length1 + embed_depth_bridge + embed_depth_headstock
+cyl_shape1 = Part.makeCylinder(radius, length_extended1, p_start1_extended, u1)
+
+# Bottom rod routing channel
+p_start2 = App.Vector(span_start_x, bridge_inset_bottom_y, bridge_center_z) 
+p_end2 = App.Vector(span_end_x, headstock_inset_bottom_y, headstock_center_z) 
+dir_vector2 = p_end2 - p_start2 
+span_length2 = dir_vector2.Length
+u2 = dir_vector2 / span_length2
+
+p_start2_extended = p_start2 - u2 * embed_depth_bridge
+length_extended2 = span_length2 + embed_depth_bridge + embed_depth_headstock
+cyl_shape2 = Part.makeCylinder(radius, length_extended2, p_start2_extended, u2)
+
+pocket_tools_shape = Part.makeCompound([cyl_shape1, cyl_shape2])
+
+final_bridge_shape = bridge_block_raw_shape.cut(pocket_tools_shape)
+final_headstock_shape = headstock_shape.cut(pocket_tools_shape)
+
+bridge_block_pocketed = doc.addObject("Part::Feature", "BridgeBlockPocketed")
+bridge_block_pocketed.Shape = final_bridge_shape
+bridge_block_pocketed.ViewObject.hide()
+
+headstock_pocketed = doc.addObject("Part::Feature", "HeadstockPocketed")
+headstock_pocketed.Shape = final_headstock_shape
+headstock_pocketed.ViewObject.hide()
+doc.recompute()
+
+
+# ==========================================
+# --- 4. IMPORT & ALIGN BODY CONTOUR ------
+# ==========================================
+
+existing_objects_pre_body = set(doc.Objects)
+
+try:
+    importSVG.insert(FILES["body_contour"], doc.Name)
+    doc.recompute()
+except Exception as e:
+    App.Console.PrintError(f"Failed to import Body Contour SVG: {str(e)}\n")
+
+body_svg_objects = [obj for doc_obj in [doc] for obj in doc_obj.Objects if obj not in existing_objects_pre_body]
+
+# Dynamically locate the midline and bridge landmarks to center body SVG at absolute world origin (0,0)
+midline_obj = None
+bridge_align_obj = None
+
+for obj in body_svg_objects:
+    name_lower = obj.Name.lower()
+    if 'midline' in name_lower:
+        midline_obj = obj
+    elif 'bridge' in name_lower:
+        bridge_align_obj = obj
+
+if not midline_obj or not bridge_align_obj:
+    for obj in body_svg_objects:
+        label_lower = obj.Label.lower() if hasattr(obj, 'Label') else ""
+        if 'midline' in label_lower:
+            midline_obj = obj
+        elif 'bridge' in label_lower:
+            bridge_align_obj = obj
+
+body_translation = App.Vector(0, 0, 0)
+if midline_obj and bridge_align_obj:
+    midline_shape = midline_obj.Shape.copy()
+    if hasattr(midline_obj, 'Placement') and midline_obj.Placement:
+        midline_shape.transformShape(midline_obj.Placement.toMatrix())
+    
+    bridge_shape_copy = bridge_align_obj.Shape.copy()
+    if hasattr(bridge_align_obj, 'Placement') and bridge_align_obj.Placement:
+        bridge_shape_copy.transformShape(bridge_align_obj.Placement.toMatrix())
+
+    midline_y = midline_shape.BoundBox.Center.y
+    bridge_x = bridge_shape_copy.BoundBox.Center.x
+    body_translation = App.Vector(-bridge_x, -midline_y, 0)
+    App.Console.PrintMessage(f"Resolved Body Translation relative to bridge center: {body_translation}\n")
+else:
+    App.Console.PrintWarning("Midline or bridge alignment marks missing. Proceeding with default local coordinate system.\n")
+
+body_contour_obj = None
+max_area = 0.0
+
+for obj in body_svg_objects:
+    name_lower = obj.Name.lower()
+    if 'midline' in name_lower or 'bridge' in name_lower:
+        continue
+    if hasattr(obj, 'Shape') and not obj.Shape.isNull():
+        bbox = obj.Shape.BoundBox
+        area = (bbox.XMax - bbox.XMin) * (bbox.YMax - bbox.YMin)
+        if area > max_area:
+            max_area = area
+            body_contour_obj = obj
+
+body_solid_shape = None
+body_sketch = None
+extrude = None
+
+if body_contour_obj:
+    try:
+        # Create a robust Draft Sketch of the body contour to heal any open points or faceted lines
+        if hasattr(Draft, "make_sketch"):
+            body_sketch = Draft.make_sketch([body_contour_obj], autoconstraints=True)
+        else:
+            body_sketch = Draft.makeSketch([body_contour_obj], autoconstraints=True)
+        doc.recompute()
+        
+        # Create a clean solid extrusion of the body contour
+        extrude = doc.addObject("Part::Extrusion", "TempBodyExtrude")
+        extrude.Base = body_sketch
+        extrude.Dir = App.Vector(0, 0, 44.0)
+        extrude.Solid = True
+        doc.recompute()
+        
+        # Copy the robust CAD solid to memory and translate it
+        body_solid_shape = extrude.Shape.copy()
+        body_solid_shape.translate(body_translation)
+        body_solid_shape.translate(App.Vector(0, 0, -33.0))
+        App.Console.PrintMessage("Successfully constructed smooth CAD solid body contour via Draft sketch.\n")
+    except Exception as e:
+        App.Console.PrintError(f"Failed to build body solid using Draft Sketch: {str(e)}\n")
+        # Fallback to direct geometric face generation
+        try:
+            outer_shape = body_contour_obj.Shape.copy()
+            outer_shape.translate(body_translation)
+            
+            if hasattr(outer_shape, "OuterWire") and outer_shape.OuterWire:
+                outer_wire = outer_shape.OuterWire
+            elif len(outer_shape.Wires) > 0:
+                outer_wire = outer_shape.Wires[0]
+            else:
+                outer_wire = outer_shape
+                
+            outer_face = Part.Face(outer_wire)
+            body_solid_shape = outer_face.extrude(App.Vector(0, 0, 44.0))
+            body_solid_shape.translate(App.Vector(0, 0, -33.0))
+        except Exception as ex:
+            App.Console.PrintError(f"Fallback body contour construction failed: {str(ex)}\n")
+else:
+    App.Console.PrintError("Could not isolate outer body contour for solid extrusion.\n")
+
+# Cleanup raw imported vectors and temporary sketch/extrusion immediately to keep tree and RAM clean
+for obj in body_svg_objects:
+    try:
+        doc.removeObject(obj.Name)
+    except Exception:
+        pass
+if body_sketch:
+    try:
+        doc.removeObject(body_sketch.Name)
+    except Exception:
+        pass
+if extrude:
+    try:
+        doc.removeObject(extrude.Name)
+    except Exception:
+        pass
+doc.recompute()
+
+
+# ==========================================
+# --- 4.5 IN-MEMORY BODY SOLID FILLETING ---
+# ==========================================
+
+# STABILITY BREAKTHROUGH: We apply cosmetic and perimeter roundover fillets directly to
+# the body solid BEFORE we cut the forearm slants, belly scoops, or cavities.
+# By filleting the simple parallel top (Z=11.0) and bottom (Z=-33.0) flat planes first,
+# OpenCASCADE performs roundovers with perfect mathematical stability. Subtraction cuts
+# (forearm, scoop, pockets) then shear smoothly through these rounded edges with zero failure modes.
+if 'body_solid_shape' in locals() and body_solid_shape:
+    # A. OUTER BODY PERIMETER ROUNDOVER (Iterative Solver up to 10mm to produce a comfortable organic contour)
+    try:
+        perimeter_edges = []
+        for edge in body_solid_shape.Edges:
+            bbox = edge.BoundBox
+            
+            # Exclude vertical side corner edges
+            is_vertical = (bbox.XMax - bbox.XMin < 0.1) and (bbox.YMax - bbox.YMin < 0.1) and (bbox.ZMax - bbox.ZMin > 40.0)
+            if is_vertical:
+                continue
+            
+            # Select simple flat top & bottom perimeter edge loops (coplanar, parallel)
+            is_top = abs(bbox.ZMin - 11.0) < 0.1 and abs(bbox.ZMax - 11.0) < 0.1
+            is_bottom = abs(bbox.ZMin - (-33.0)) < 0.1 and abs(bbox.ZMax - (-33.0)) < 0.1
+            
+            # STABILITY RESOLVED: We exclude ONLY the edges inside the neck pocket on the top surface.
+            # The neck pocket has a width of 90mm (Y between -45.0 and 45.0) and sits at the front (X > 180.0).
+            # Excluding these keeps the joint sharp and flat, preventing intersection collisions
+            # during the subsequent neck-body heel joint filleting, while allowing the horn fillets
+            # to run cleanly and terminate at the pocket corners.
+            is_neck_pocket_edge = is_top and (bbox.XMax > 180.0) and (abs(bbox.Center.y) < 46.0)
+            
+            if is_neck_pocket_edge:
+                continue
+            
+            if is_top or is_bottom:
+                perimeter_edges.append(edge)
+
+        if perimeter_edges:
+            # Iterate from 10mm down to 1mm (as requested, reducing the maximum tried radius to 10mm to avoid excessive roundness)
+            radii_to_try = [10.0, 8.0, 6.0, 4.0, 2.0, 1.0]
+            for radius in radii_to_try:
+                try:
+                    temp_shape = body_solid_shape.makeFillet(radius, perimeter_edges)
+                    # CRITICAL BREAKTHROUGH: We verify the shape is topologically valid using FreeCAD's native '.isValid()' check.
+                    # This prevents corrupted or self-intersecting shapes from overwriting the solid and crashing downstream boolean cuts.
+                    if temp_shape and not temp_shape.isNull() and temp_shape.isValid() and temp_shape.Volume > 0:
+                        body_solid_shape = temp_shape
+                        App.Console.PrintMessage(f"Successfully applied {radius}mm organic perimeter roundover in-memory.\n")
+                        break
+                except Exception:
+                    pass
+                finally:
+                    gc.collect()
+    except Exception as e:
+        App.Console.PrintError(f"In-memory outer body perimeter filleting failed: {str(e)}\n")
+
+
+# ==========================================
+# --- 5. ERGONOMIC BODY PROFILING ----------
+# ==========================================
+
+if 'body_solid_shape' in locals() and body_solid_shape:
+    # A. Forearm Cut-away Slant
+    try:
+        arm_angle = 10.0  
+        cut_x_start = -310.0 
+        cut_y_start = -40.0 
+        
+        # Created purely in-memory (No document objects)
+        forearm_axis = App.Vector(1.0, 0.15 * side_multiplier, 0.0)
+        arm_rot = App.Rotation(forearm_axis, -arm_angle * side_multiplier)
+        
+        y_box_offset = -250 if is_left_handed else 0
+        cutter_shape = Part.makeBox(500, 250, 100)  # Build at origin
+        
+        # Position and rotate the in-memory TopoShape box using a standard placement matrix
+        placement = App.Placement(App.Vector(cut_x_start, cut_y_start + y_box_offset, 11.0), arm_rot, App.Vector(0, -y_box_offset, 0))
+        cutter_shape.transformShape(placement.toMatrix())
+        
+        body_solid_shape = body_solid_shape.cut(cutter_shape)
+        App.Console.PrintMessage("Successfully applied in-memory forearm cutaway slant.\n")
+    except Exception as e:
+        App.Console.PrintError(f"Failed to apply forearm cutaway slant: {str(e)}\n")
+
+    # B. Ergonomic Belly Scoop
+    try:
+        cone_r1 = 250.0  
+        cone_r2 = 25.0   
+        cone_h = 45.0   
+        
+        # Created purely in-memory (No document objects)
+        belly_shape = Part.makeCone(cone_r1, cone_r2, cone_h)  # Build at origin
+        belly_x = 220.0
+        belly_y = 165.0 * side_multiplier
+        belly_rot = App.Rotation(App.Vector(0, 0, 1), -90)
+        
+        # Position and rotate the in-memory TopoShape cone using a standard placement matrix
+        belly_placement = App.Placement(App.Vector(belly_x - cone_h/2, belly_y, -33.0 + cone_h/2 * side_multiplier), belly_rot)
+        belly_shape.transformShape(belly_placement.toMatrix())
+        
+        body_solid_shape = body_solid_shape.cut(belly_shape)
+        App.Console.PrintMessage("Successfully applied in-memory ergonomic belly scoop.\n")
+    except Exception as e:
+        App.Console.PrintError(f"Failed to apply ergonomic belly scoop: {str(e)}\n")
+
+    # C. ERGONOMIC CUTAWAY BLENDS (Forearm & Belly scoop transition boundaries)
+    try:
+        cutaway_edges = []
+        for edge in body_solid_shape.Edges:
+            bbox = edge.BoundBox
+            # Identify belly scoop boundaries
+            is_belly_edge = bbox.XMin > 100.0 and (bbox.Center.y * side_multiplier) > 100.0 and bbox.ZMax < 5.0
+            # Identify forearm slant boundaries
+            is_forearm_edge = bbox.XMax < 100.0 and bbox.Center.z > 0.0 and abs(bbox.Center.y - (-40.0 * side_multiplier)) > 50.0
+            
+            if is_belly_edge or is_forearm_edge:
+                cutaway_edges.append(edge)
+
+        if cutaway_edges:
+            for radius in [12.0, 10.0, 8.0, 6.0, 4.0, 2.0]:
+                try:
+                    temp_shape = body_solid_shape.makeFillet(radius, cutaway_edges)
+                    if temp_shape and not temp_shape.isNull() and temp_shape.isValid() and temp_shape.Volume > 0:
+                        body_solid_shape = temp_shape
+                        App.Console.PrintMessage(f"Applied {radius}mm fillet to ergonomic cutaways in-memory.\n")
+                        break
+                except Exception:
+                    pass
+                finally:
+                    gc.collect()
+    except Exception as e:
+        App.Console.PrintError(f"In-memory ergonomic cutaway filleting failed: {str(e)}\n")
+
+
+# ==========================================
+# --- 6. ROUT ELECTRONICS CAVITIES & PATH -
+# ==========================================
+
+if 'body_solid_shape' in locals() and body_solid_shape:
+    controls_y = -100.0 * side_multiplier
+    
+    cavity_ops = [
+        ("cavity", 35.0, -34.0, "CavityRoute"),
+        ("cavity_flange", 6.0, -34.0, "CavityFlangeRoute"),
+        ("pot_holes", 50.0, -34.0, "PotHolesRoute")
+    ]
+    
+    for key, depth, z_pos, name in cavity_ops:
+        if key in FILES:
+            # create_svg_solid handles sketch resolution and returns a clean, manifold raw solid
+            tool_shape = create_svg_solid(FILES[key], depth, name, doc)
+            
+            if tool_shape:
+                # Center the tool shape precisely relative to its bounding box
+                bbox = tool_shape.BoundBox
+                x_mid = (bbox.XMin + bbox.XMax) / 2.0
+                y_mid = (bbox.YMin + bbox.YMax) / 2.0
+                z_min = bbox.ZMin
+                
+                # First translate to origin (0, 0, 0)
+                tool_shape.translate(App.Vector(-x_mid, -y_mid, -z_min))
+                # Then place exactly at (0.0, controls_y, z_pos)
+                tool_shape.translate(App.Vector(0.0, controls_y, z_pos))
+                
+                # Perform the robust subtraction
+                body_solid_shape = body_solid_shape.cut(tool_shape)
+
+    # Apply rod channel, bridge slot, and body pocket cuts purely in memory
+    body_pocketed_shape = body_solid_shape.cut(pocket_tools_shape) 
+    body_pocketed_shape = body_pocketed_shape.cut(bridge_shape)        
+    
+    # --- STRAP BUTTON THREADED INSERT CUTS ---
+    try:
+        # A standard heavy-duty M5 insert requires a 6.8mm pilot hole diameter (radius = 3.4mm)
+        insert_radius = 3.4 
+        
+        # 1. Left Butt-end Strap Insert (aligned with Y = -45.0, center plane Z = -11.0)
+        # We project a test ray from far-left (X=-500) to find the precise outer boundary of the body
+        butt_x = -93.0  # Safe fallback coordinate
+        try:
+            test_line = Part.makeLine(App.Vector(-500.0, -45.0, -11.0), App.Vector(0.0, -45.0, -11.0))
+            intersect = body_pocketed_shape.common(test_line)
+            if intersect and not intersect.isNull() and intersect.Vertexes:
+                butt_x = min(v.Point.x for v in intersect.Vertexes)
+                App.Console.PrintMessage(f"Dynamically resolved outer body butt-end boundary at X = {butt_x:.2f}mm\n")
+            else:
+                App.Console.PrintWarning("Strap button boundary intersection returned empty. Using fallback coordinate.\n")
+        except Exception as e:
+            App.Console.PrintWarning(f"Strap button boundary projection failed: {str(e)}. Using fallback coordinate.\n")
+        
+        # Start the cylinder 1mm outside the boundary (butt_x - 1.0) and cut 26mm inwards (depth = 25mm)
+        butt_insert_hole = Part.makeCylinder(
+            insert_radius, 
+            26.0, 
+            App.Vector(butt_x - 1.0, -45.0, -11.0), 
+            App.Vector(1, 0, 0)
+        )
+        
+        # 2. Upper Horn Strap Insert (starts at the maximum X boundary of the upper horn, Z = -11.0)
+        # We geometrically find the absolute forward tip (maximum X) of the horn solid
+        horn_x = 458.0  # Safe fallback coordinate
+        horn_y = 115.0 * side_multiplier  # Fallback horn Y position based on handedness
+        horn_pts = [v.Point for v in body_pocketed_shape.Vertexes if v.Point.x > 400.0]
+        if horn_pts:
+            horn_pts.sort(key=lambda p: p.x, reverse=True)
+            horn_x = horn_pts[0].x
+            horn_y = horn_pts[0].y
+            
+        # Start the cylinder 1mm outside the horn tip face (horn_x + 1.0) and cut 26mm inwards (depth = 25mm)
+        horn_insert_hole = Part.makeCylinder(
+            insert_radius, 
+            26.0, 
+            App.Vector(horn_x + 1.0, horn_y, -11.0), 
+            App.Vector(-1, 0, 0)
+        )
+        
+        # Perform the clean subtractive cutting
+        strap_cutters = Part.makeCompound([butt_insert_hole, horn_insert_hole])
+        body_pocketed_shape = body_pocketed_shape.cut(strap_cutters)
+        App.Console.PrintMessage("Successfully cut strap button pilot holes for M5 threaded inserts.\n")
+    except Exception as strap_err:
+        App.Console.PrintWarning(f"Failed to cut strap button holes: {str(strap_err)}\n")
+        
+    # --- ADDED: ROLAND GK-3B ROUTING CHANNEL ---
+    try:
+        # Define a beautifully radiused, continuous 3D curve that sweeps down and across,
+        # ensuring we drop safely below the reinforcement rods (Z < -15mm) before we cross 
+        # their Y-positions, avoiding any sharp 90-degree bends that could snag the GK-3B plug.
+        p_start_gk = App.Vector(40.0, 0.0, 15.0)
+        pts_gk = [
+            p_start_gk,
+            App.Vector(40.0, controls_y * 0.05, 5.0),    # Smoothly starts moving in Y as it drops
+            App.Vector(40.0, controls_y * 0.12, -10.0),  # Safe descent, Y is still under 12mm (far from 20mm rod)
+            App.Vector(38.0, controls_y * 0.22, -22.0),  # Reaches safe Z=-22 depth before crossing Y=20 rod coordinate
+            App.Vector(30.0, controls_y * 0.45, -22.0),  # Sweeping horizontally underneath the rod
+            App.Vector(15.0, controls_y * 0.75, -22.0),  # Continuing gentle curve towards cavity
+            App.Vector(0.0, controls_y, -22.0)           # Smooth exit into the cavity
+        ]
+        
+        gk_channel = None
+        try:
+            # Interpolate points using FreeCAD's native BSplineCurve geometry class
+            curve_gk = Part.BSplineCurve()
+            curve_gk.interpolate(pts_gk)
+            edge_gk = curve_gk.toShape()  # Correctly returns a Part.Edge
+            path_wire_gk = Part.Wire([edge_gk])
+            
+            # Align the circular profile normal dynamically with the tangent vector of the first segment
+            initial_dir = (pts_gk[1] - pts_gk[0]).normalize()
+            circle_gk = Part.makeCircle(5.0, p_start_gk, initial_dir)  # Returns a Part.Edge
+            circle_wire_gk = Part.Wire([circle_gk])                    # Accept the Edge directly, no illegal .toShape()
+            circle_face_gk = Part.Face(circle_wire_gk)
+            
+            # Construct the solid pipe by calling makePipe directly on the path wire
+            gk_channel = path_wire_gk.makePipe(circle_face_gk)
+            App.Console.PrintMessage("Constructed smooth B-spline sweep for GK-3B channel using makePipe.\n")
+        except Exception as sweep_err:
+            App.Console.PrintWarning(f"B-spline sweep failed ({str(sweep_err)}). Falling back to multi-segment cylinder chain.\n")
+            # Fail-safe chain of jointed cylinders to guarantee script compilation
+            cyls = []
+            for i in range(len(pts_gk) - 1):
+                p1 = pts_gk[i]
+                p2 = pts_gk[i+1]
+                vec = p2 - p1
+                if vec.Length > 0.001:
+                    cyls.append(Part.makeCylinder(5.0, vec.Length, p1, vec))
+            if cyls:
+                gk_channel = Part.makeCompound(cyls)
+
+        if gk_channel:
+            # Cut channel from the main body solid
+            body_pocketed_shape = body_pocketed_shape.cut(gk_channel)
+            App.Console.PrintMessage("Successfully routed Roland GK-3B 10mm curved routing channel (bypassing the bridge block and reinforcement rods).\n")
+    except Exception as gk_err:
+        App.Console.PrintWarning(f"Failed to cut Roland GK-3B routing channel: {str(gk_err)}\n")
+        
+    # --- ADDED: FINGER RAMP INTEGRATION ---
+    try:
+        # Generate the crowned ramp shape
+        # Dimensions: X=80mm, Y=110mm (widened to match bridge block), Z=6mm thickness. Crowned to 500mm radius.
+        # Placed starting at X=75mm -> spans X=75 to X=155
+        ramp_wire = create_ramp_wire(75.0, 0.0, 110.0, 6.0, 11.0, 500.0)
+        ramp_face = Part.Face(ramp_wire)
+        ramp_solid = ramp_face.extrude(App.Vector(80.0, 0, 0))
+        
+        # Roll the top longitudinal outside edges (comfort contour similar to the rolled fretboard edges)
+        ramp_edges_to_roll = []
+        for edge in ramp_solid.Edges:
+            bbox = edge.BoundBox
+            is_longitudinal = (bbox.XMax - bbox.XMin) > 75.0
+            is_top = bbox.ZMin > 12.0
+            if is_longitudinal and is_top:
+                ramp_edges_to_roll.append(edge)
+                
+        if ramp_edges_to_roll:
+            for r in [1.2, 1.0, 0.8, 0.5]:
+                try:
+                    temp_ramp = ramp_solid.makeFillet(r, ramp_edges_to_roll)
+                    if temp_ramp and not temp_ramp.isNull() and temp_ramp.isValid():
+                        ramp_solid = temp_ramp
+                        App.Console.PrintMessage(f"Successfully rolled finger ramp edges with {r}mm radius contours.\n")
+                        break
+                except Exception as roll_err:
+                    App.Console.PrintWarning(f"Rolling ramp edges failed for radius {r}: {str(roll_err)}\n")
+                    
+        # Fuse the completed ramp onto the body solid
+        body_pocketed_shape = body_pocketed_shape.fuse(ramp_solid)
+        App.Console.PrintMessage("Successfully integrated the 500mm radiused finger ramp to the body solid.\n")
+    except Exception as ramp_err:
+        App.Console.PrintError(f"Failed to generate finger ramp: {str(ramp_err)}\n")
+        
+    # Create final visual body feature with our pristine in-memory shape
+    body_feature = doc.addObject("Part::Feature", "FinalBody")
+    body_feature.Shape = body_pocketed_shape
+    body_feature.ViewObject.ShapeColor = (0.78, 0.45, 0.35) 
+    doc.recompute()
+
+
+# ==========================================
+# --- 7. DESIGN TAPERED SEMI-ELLIPSE NECK --
+# ==========================================
+
+neck_length = (0.75 * scale_length) + 5.0  # 653.0 mm
+neck_stop_x = span_end_x - neck_length     # 211.0 mm
+
+width_headstock = headstock_top_y - headstock_bottom_y
+center_y = (headstock_top_y + headstock_bottom_y) / 2.0
+
+# Interpolate taper geometries across playing length
+bridge_screw_span = max(y_positions) - min(y_positions)  # 90.0 mm
+thickness_heel = 24.5  
+
+def get_neck_width(x):
+    return bridge_screw_span + (width_headstock - bridge_screw_span) * (x / scale_length)
+
+def get_neck_thickness(x):
+    return thickness_heel + (17.0 - thickness_heel) * ((x - neck_stop_x) / (span_end_x - neck_stop_x))
+
+def create_semi_ellipse_wire(x, y_center, width, thickness, z_top=17.0):
+    import math
+    ry = width / 2.0
+    rz = thickness
+    num_points = 8 
+    arc_points = []
+    for i in range(num_points + 1):
+        theta = math.pi + (i / float(num_points)) * math.pi
+        curr_y = y_center + ry * math.cos(theta)
+        curr_z = z_top + rz * math.sin(theta)
+        arc_points.append(App.Vector(x, curr_y, curr_z))
+    
+    try:
+        curve = Part.BSplineCurve()
+        curve.interpolate(arc_points)
+        curve_edge = curve.toShape()
+        
+        flat_edge = Part.makeLine(arc_points[-1], arc_points[0])
+        wire = Part.Wire([curve_edge, flat_edge])
+        return wire
+    except Exception as e:
+        App.Console.PrintWarning(f"BSpline interpolation failed at X={x}, falling back to faceted polygon: {str(e)}\n")
+        polygon_points = arc_points + [arc_points[0]]
+        return Part.makePolygon(polygon_points)
+
+def create_rectangle_wire(x, y_center, width, thickness, z_top=17.0):
+    ry = width / 2.0
+    rz = thickness
+    p1 = App.Vector(x, y_center - ry, z_top)          
+    p2 = App.Vector(x, y_center - ry, z_top - rz)     
+    p3 = App.Vector(x, y_center + ry, z_top - rz)     
+    p4 = App.Vector(x, y_center + ry, z_top)          
+    polygon = Part.makePolygon([p1, p2, p3, p4, p1])
+    return polygon
+
+width_heel = 90.0 # Safe fallback definition
+try:
+    x_neck_end = span_end_x - 25.0
+    width_heel = get_neck_width(neck_stop_x)
+    width_neck_end = get_neck_width(x_neck_end)
+    thickness_neck_end = get_neck_thickness(x_neck_end)
+
+    wire_heel = create_semi_ellipse_wire(neck_stop_x, center_y, width_heel, thickness_heel)
+    wire_neck_end = create_semi_ellipse_wire(x_neck_end, center_y, width_neck_end, thickness_neck_end)
+    wire_headstock_rect = create_rectangle_wire(span_end_x, center_y, width_headstock, 17.0)
+    
+    neck_main_solid = Part.makeLoft([wire_heel, wire_neck_end], True)
+    neck_transition_solid = Part.makeLoft([wire_neck_end, wire_headstock_rect], True)
+    neck_solid = neck_main_solid.fuse(neck_transition_solid)
+    
+    # Reload pocket tools to cut neck canal safely
+    radius = 10.5 / 2.0 
+    p_start1 = App.Vector(span_start_x, bridge_inset_top_y, bridge_center_z) 
+    p_end1 = App.Vector(span_end_x, headstock_inset_top_y, headstock_center_z) 
+    dir_vector1 = p_end1 - p_start1 
+    span_length1 = dir_vector1.Length
+    u1 = dir_vector1 / span_length1
+    p_start1_extended = p_start1 - u1 * embed_depth_bridge
+    length_extended1 = span_length1 + embed_depth_bridge + embed_depth_headstock
+    cyl_shape1 = Part.makeCylinder(radius, length_extended1, p_start1_extended, u1)
+
+    p_start2 = App.Vector(span_start_x, bridge_inset_bottom_y, bridge_center_z) 
+    p_end2 = App.Vector(span_end_x, headstock_inset_bottom_y, headstock_center_z) 
+    dir_vector2 = p_end2 - p_start2 
+    span_length2 = dir_vector2.Length
+    u2 = dir_vector2 / span_length2
+    p_start2_extended = p_start2 - u2 * embed_depth_bridge
+    length_extended2 = span_length2 + embed_depth_bridge + embed_depth_headstock
+    cyl_shape2 = Part.makeCylinder(radius, length_extended2, p_start2_extended, u2)
+
+    pocket_tools_shape_neck = Part.makeCompound([cyl_shape1, cyl_shape2])
+    final_neck_shape = neck_solid.cut(pocket_tools_shape_neck)
+    
+    # --- ADDED: 7mm FRETBOARD GENERATION WITH 24 FRETS, MARKERS & SLOTS ---
+    try:
+        import math
+        # Build a tapered fretboard solid starting at Z=17.0, thickness=7.0 (reaching Z=24.0)
+        # Using the new 500mm radius wire generator to produce a perfectly curved top face
+        wire_fretboard_heel = create_fretboard_radiused_wire(neck_stop_x, center_y, width_heel)
+        wire_fretboard_neck_end = create_fretboard_radiused_wire(x_neck_end, center_y, width_neck_end)
+        wire_fretboard_headstock = create_fretboard_radiused_wire(span_end_x, center_y, width_headstock)
+        
+        fretboard_main_solid = Part.makeLoft([wire_fretboard_heel, wire_fretboard_neck_end], True)
+        fretboard_transition_solid = Part.makeLoft([wire_fretboard_neck_end, wire_fretboard_headstock], True)
+        fretboard_solid = fretboard_main_solid.fuse(fretboard_transition_solid)
+        
+        # --- ROLLING THE FRETBOARD EDGES (Filleting Outside Longitudinal Edges) ---
+        # Dynamic Edge Scan: Find the two top long longitudinal outside edges running from the heel to nut.
+        # We target edges that have an X-span longer than 400mm and a Z-coordinate safely above Z=20mm (avoiding the bottom edges).
+        fb_edges_to_roll = []
+        for edge in fretboard_solid.Edges:
+            bbox = edge.BoundBox
+            is_longitudinal = (bbox.XMax - bbox.XMin) > 400.0
+            is_top = bbox.ZMin > 20.0
+            if is_longitudinal and is_top:
+                fb_edges_to_roll.append(edge)
+                
+        if fb_edges_to_roll:
+            # We apply a comfortable 1.2mm radius roll to the top corners
+            for r in [1.2, 1.0, 0.8, 0.5]:
+                try:
+                    temp_fb = fretboard_solid.makeFillet(r, fb_edges_to_roll)
+                    if temp_fb and not temp_fb.isNull() and temp_fb.isValid() and temp_fb.Volume > 0:
+                        fretboard_solid = temp_fb
+                        App.Console.PrintMessage(f"Successfully rolled fretboard edges with comfortable {r}mm radius contours.\n")
+                        break
+                except Exception as roll_err:
+                    App.Console.PrintWarning(f"Rolling fretboard edges failed for radius {r}: {str(roll_err)}\n")
+                    
+        # Specified fret indexes to mark with rectangular pocket cuts
+        target_marker_frets = [3, 5, 7, 9, 12, 15, 17, 19, 21, 24]
+        marker_cutters = []
+        side_marker_cutters = []
+        fret_slots = []
+        
+        # Side markers geometry parameters
+        sm_length = 2.0
+        sm_height = 1.5
+        sm_depth = 1.5
+        
+        for n in range(1, 25): # Loop cleanly from Fret 1 through 24
+            # Scale length formula to find the exact boundary of the fret space
+            fret_x = scale_length * (2.0 ** (-n / 12.0))
+            
+            # --- CONCENTRIC CURVED FRET SLOTS ---
+            # Standard luthier specifications: width=0.6mm, depth=1.5mm from top radiused face
+            w_fret = get_neck_width(fret_x)
+            slot_box = create_curved_slot_cutter(fret_x, center_y, w_fret)
+            fret_slots.append(slot_box)
+            
+            # --- INLAY MARKERS & SIDE MARKERS ---
+            if n in target_marker_frets:
+                prev_fret_x = scale_length * (2.0 ** (-(n - 1) / 12.0))
+                marker_x = (fret_x + prev_fret_x) / 2.0
+                
+                # Scale the marker length as 35% of the local fret spacing (capped at 6mm)
+                fret_spacing = prev_fret_x - fret_x
+                marker_length = min(6.0, fret_spacing * 0.35)
+                
+                # Scale the marker width based on the local tapered neck width
+                w_marker = get_neck_width(marker_x)
+                marker_width = w_marker * 0.4
+                
+                # --- FACE INLAY MARKERS (Starts at Z=22.5, flat bottoms, cuts cleanly through top curve)
+                if n in [12, 24]:
+                    offset_y = marker_width * 0.25
+                    sub_width = marker_width * 0.35
+                    box_l = Part.makeBox(marker_length, sub_width, 2.0, App.Vector(marker_x - marker_length / 2.0, center_y - offset_y - sub_width / 2.0, 22.5))
+                    box_r = Part.makeBox(marker_length, sub_width, 2.0, App.Vector(marker_x - marker_length / 2.0, center_y + offset_y - sub_width / 2.0, 22.5))
+                    marker_cutters.extend([box_l, box_r])
+                else:
+                    box_marker = Part.makeBox(marker_length, marker_width, 2.0, App.Vector(marker_x - marker_length / 2.0, center_y - marker_width / 2.0, 22.5))
+                    marker_cutters.append(box_marker)
+                
+                # --- ADAPTIVE SIDE FRET MARKERS ---
+                # Calculate the exact edge height under the crown drop-off
+                ry_marker = w_marker / 2.0
+                z_edge = (24.0 - 500.0) + math.sqrt(500.0**2 - ry_marker**2)
+                
+                # Center the side markers dynamically on the actual side-profile edge height (below rolled fillet contour)
+                z_mid_face = 17.0 + (z_edge - 17.0) / 2.0
+                z_start_sm = z_mid_face - sm_height / 2.0
+                
+                edge_y = center_y + side_multiplier * ry_marker
+                
+                if side_multiplier == -1:
+                    # On the -Y side, cut upwards towards center_y (+Y direction)
+                    y_start = edge_y - 0.1
+                else:
+                    # On the +Y side, cut downwards towards center_y (-Y direction)
+                    y_start = edge_y - sm_depth
+                
+                if n in [12, 24]:
+                    # Double side markers spaced along the X axis
+                    spacing = 2.0
+                    sm_box_l = Part.makeBox(
+                        sm_length, 
+                        sm_depth + 0.1, 
+                        sm_height, 
+                        App.Vector(marker_x - spacing - sm_length / 2.0, y_start, z_start_sm)
+                    )
+                    sm_box_r = Part.makeBox(
+                        sm_length, 
+                        sm_depth + 0.1, 
+                        sm_height, 
+                        App.Vector(marker_x + spacing - sm_length / 2.0, y_start, z_start_sm)
+                    )
+                    side_marker_cutters.extend([sm_box_l, sm_box_r])
+                else:
+                    sm_box = Part.makeBox(
+                        sm_length, 
+                        sm_depth + 0.1, 
+                        sm_height, 
+                        App.Vector(marker_x - sm_length / 2.0, y_start, z_start_sm)
+                    )
+                    side_marker_cutters.append(sm_box)
+                
+        # Subtract the inlay marker pockets
+        if marker_cutters:
+            markers_compound = Part.makeCompound(marker_cutters)
+            fretboard_solid = fretboard_solid.cut(markers_compound)
+            
+        # Subtract the side fret markers
+        if side_marker_cutters:
+            side_markers_compound = Part.makeCompound(side_marker_cutters)
+            fretboard_solid = fretboard_solid.cut(side_markers_compound)
+            
+        # Subtract the curved concentric fret wire slots
+        if fret_slots:
+            slots_compound = Part.makeCompound(fret_slots)
+            fretboard_solid = fretboard_solid.cut(slots_compound)
+            
+        # Fuse Fretboard to Neck Front face (Z = 17.0 interface)
+        final_neck_shape = final_neck_shape.fuse(fretboard_solid)
+        App.Console.PrintMessage("Successfully generated radiused fretboard with rolled edges, curved slots and markers, fused to neck.\n")
+    except Exception as fb_err:
+        App.Console.PrintError(f"Failed to generate fretboard solid: {str(fb_err)}\n")
+    
+    neck_pocketed = doc.addObject("Part::Feature", "FinalNeck")
+    neck_pocketed.Shape = final_neck_shape
+    neck_pocketed.ViewObject.ShapeColor = (0.8, 0.7, 0.5)
+    
+    # Mill the pocket socket joint out of the body
+    # STABILITY MASTERCLASS: We cut the neck pocket out of our in-memory body solid shape
+    # 'body_pocketed_shape' here. This synchronizes the pocket cut so that the final solid body
+    # meets the neck at perfectly coplanar boundaries during fusion in Section 8.
+    if 'body_pocketed_shape' in locals() and body_pocketed_shape and 'neck_solid' in locals() and neck_solid:
+        body_pocketed_shape = body_pocketed_shape.cut(neck_solid)
+        if 'body_feature' in locals() and body_feature:
+            body_feature.Shape = body_pocketed_shape
+        doc.recompute()
+        App.Console.PrintMessage("Constructed neck pocket in body successfully.\n")
+        
+    App.Console.PrintMessage("Successfully constructed neck solid with split main and transition lofts.\n")
+except Exception as e:
+    App.Console.PrintError(f"Failed to generate neck profile: {str(e)}\n")
+
+
+# ==========================================
+# --- 8. POST-PROCESSING FILLETS -----------
+# ==========================================
+
+# --- STEP 1: CONNECT NECK AND BODY (UNION) ---
+# ARCHITECTURAL BREAKTHROUGH: Fusing neck and body solids in-memory.
+# If a direct mathematical Boolean Union fails due to boundary limits, we fall back to a
+# 100% stable Part Compound to ensure geometry compiles without stopping the execution flow.
+instrument_feature = None
+if 'body_pocketed_shape' in locals() and 'final_neck_shape' in locals():
+    if not body_pocketed_shape.isNull() and not final_neck_shape.isNull():
+        App.Console.PrintMessage("Assembling neck and body solids in-memory...\n")
+        try:
+            # Try a standard Boolean Union (fuse)
+            fused_instrument_shape = body_pocketed_shape.fuse(final_neck_shape)
+            if fused_instrument_shape.isNull() or fused_instrument_shape.Volume <= 0 or not fused_instrument_shape.isValid():
+                raise Exception("Union generated an invalid or null shape representation.")
+            App.Console.PrintMessage("Successfully fused neck and body into a single continuous solid.\n")
+            
+            # --- SEQUENTIAL FILLET BLENDING WITH REAL-TIME TOPOLOGY UPDATE ---
+            # STABILITY BREAKTHROUGH: To prevent 'stale reference' crashes (where a previous fillet step
+            # invalidates the topological edge pointers of subsequent fillets), we select and fillet
+            # each seam sequentially. This ensures that the edge references are always obtained from
+            # the most up-to-date, newly generated shape.
+
+            # A. Apply Heel Joint Fillet (Target 10mm to match new body limits, with step-down solver)
+            heel_edges = []
+            try:
+                # Dynamic geometric scan: find edges belonging to the heel joint interface at X = 211.0
+                for edge in fused_instrument_shape.Edges:
+                    bbox = edge.BoundBox
+                    # Is the edge sitting on or crossing the neck-body transition plane X = 211.0?
+                    if (bbox.XMin < 212.0 and bbox.XMax > 210.0) or abs(bbox.Center.x - 211.0) < 2.0:
+                        # Is it on the back of the instrument/neck heel region? (Z < 10.0)
+                        if bbox.Center.z < 10.0 and bbox.YMax - bbox.YMin > 2.0:
+                            # Avoid selecting longitudinal neck shafts (length should be restricted to joint width)
+                            if (bbox.XMax - bbox.XMin) < 15.0:
+                                heel_edges.append(edge)
+                
+                if heel_edges:
+                    App.Console.PrintMessage(f"Geometrically resolved {len(heel_edges)} Heel Joint edges for blending.\n")
+                else:
+                    # Index fallback (Edge 21/Index 20, Edge 14/Index 13, Edge 10/Index 9)
+                    if len(fused_instrument_shape.Edges) >= 21:
+                        heel_edges = [
+                            fused_instrument_shape.Edges[20],
+                            fused_instrument_shape.Edges[13],
+                            fused_instrument_shape.Edges[9]
+                        ]
+                        App.Console.PrintMessage("Heel edges resolved via index-based fallback (Edge21, Edge14, Edge10).\n")
+            except Exception as e:
+                App.Console.PrintWarning(f"Failed to gather heel edges: {str(e)}\n")
+
+            if heel_edges:
+                # Capped at 10.0mm max radius to prevent clashing with the 10.0mm perimeter roundover
+                heel_radii = [10.0, 8.0, 6.0, 4.0, 2.0, 1.0]
+                for r in heel_radii:
+                    try:
+                        test_shape = fused_instrument_shape.makeFillet(r, heel_edges)
+                        if test_shape and not test_shape.isNull() and test_shape.isValid() and test_shape.Volume > 0:
+                            fused_instrument_shape = test_shape
+                            App.Console.PrintMessage(f"Successfully applied {r}mm fillet to Heel Joint edges.\n")
+                            break
+                    except Exception:
+                        pass
+
+            # B. Locate and Apply Back Ergonomic Seam Fillet (Target 80mm, descending step-down solver)
+            # Note: We query the edges of the UPDATED shape here to prevent stale references / Standard_Failure!
+            back_seam_edge = None
+            for edge in fused_instrument_shape.Edges:
+                bbox = edge.BoundBox
+                # Scan for back seam edge crossing the joint plane (X in 207..215, Z < 5.0, Y side_multiplier > 10)
+                if bbox.XMin < 215.0 and bbox.XMax > 207.0:
+                    if bbox.Center.z < 5.0:
+                        if (bbox.Center.y * side_multiplier) > 10.0:
+                            if edge.Length > 15.0:
+                                back_seam_edge = edge
+                                break
+
+            if back_seam_edge:
+                back_radii = [80.0, 60.0, 40.0, 30.0, 20.0, 15.0, 10.0, 5.0, 2.0]
+                for r in back_radii:
+                    try:
+                        test_shape_14 = fused_instrument_shape.makeFillet(r, [back_seam_edge])
+                        if test_shape_14 and not test_shape_14.isNull() and test_shape_14.isValid() and test_shape_14.Volume > 0:
+                            fused_instrument_shape = test_shape_14
+                            App.Console.PrintMessage(f"Successfully applied {r}mm fillet to back ergonomic cutaway seam.\n")
+                            break
+                    except Exception:
+                        pass
+            else:
+                App.Console.PrintWarning("Back ergonomic seam not found geometrically on the updated shape. Fillet bypassed.\n")
+
+            # C. Locate and Apply Front Ergonomic Seam Fillet (Target 150mm, descending step-down solver)
+            # Note: We query the edges of the UPDATED shape here to prevent stale references / Standard_Failure!
+            front_seam_edge = None
+            for edge in fused_instrument_shape.Edges:
+                bbox = edge.BoundBox
+                # Scan for front seam edge crossing the joint plane (X in 207..215, Z > -5.0, Y side_multiplier < -10)
+                if bbox.XMin < 215.0 and bbox.XMax > 207.0:
+                    if bbox.Center.z > -5.0:
+                        if (bbox.Center.y * side_multiplier) < -10.0:
+                            if edge.Length > 15.0:
+                                front_seam_edge = edge
+                                break
+
+            if front_seam_edge:
+                front_radii = [150.0, 120.0, 90.0, 60.0, 40.0, 30.0, 20.0, 10.0, 5.0, 2.0]
+                for r in front_radii:
+                    try:
+                        test_shape_59 = fused_instrument_shape.makeFillet(r, [front_seam_edge])
+                        if test_shape_59 and not test_shape_59.isNull() and test_shape_59.isValid() and test_shape_59.Volume > 0:
+                            fused_instrument_shape = test_shape_59
+                            App.Console.PrintMessage(f"Successfully applied {r}mm fillet to front ergonomic cutaway seam.\n")
+                            break
+                    except Exception:
+                        pass
+            else:
+                App.Console.PrintWarning("Front ergonomic seam not found geometrically on the updated shape. Fillet bypassed.\n")
+                
+        except Exception as e:
+            # Fallback construct to prevent Null Shape errors
+            App.Console.PrintWarning(f"Standard Union failed ({str(e)}). Falling back to dynamic solid compounding...\n")
+            fused_instrument_shape = Part.makeCompound([body_pocketed_shape, final_neck_shape])
+            
+        # Add the assembly as a single document feature
+        instrument_feature = doc.addObject("Part::Feature", "FinalInstrument")
+        instrument_feature.Shape = fused_instrument_shape
+        instrument_feature.ViewObject.ShapeColor = (0.78, 0.45, 0.35)
+        doc.recompute()
+
+
+# --- STEP 2: BRIDGE BLOCK CORNER FILLETS (3mm) ---
+bridge_edges_to_fillet = [] 
+target_corner_x = 60.0 / 2.0   
+target_corner_y = 110.0 / 2.0  
+
+for idx, edge in enumerate(bridge_block_pocketed.Shape.Edges):
+    if isinstance(edge.Curve, Part.Line) or hasattr(edge.Curve, 'Direction'): 
+        bbox = edge.BoundBox 
+        is_vertical = (bbox.XMax - bbox.XMin < epsilon) and (bbox.YMax - bbox.YMin < epsilon) 
+        is_full_height = abs((bbox.ZMax - bbox.ZMin) - 30.0) < epsilon 
+        
+        if is_vertical and is_full_height: 
+            avg_x = (bbox.XMax + bbox.XMin) / 2.0 
+            avg_y = (bbox.YMax + bbox.YMin) / 2.0 
+            
+            if abs(abs(avg_x) - target_corner_x) < epsilon and abs(abs(avg_y) - target_corner_y) < epsilon: 
+                bridge_edges_to_fillet.append(edge) 
+
+if bridge_edges_to_fillet: 
+    for r in [3.0, 2.0, 1.0]:
+        try:
+            test_shape = bridge_block_pocketed.Shape.makeFillet(r, bridge_edges_to_fillet)
+            if test_shape and not test_shape.isNull() and test_shape.isValid() and test_shape.Volume > 0:
+                bridge_block_pocketed.Shape = test_shape
+                bridge_block_pocketed.Label = "FinalBridgeBlock"
+                doc.recompute()
+                App.Console.PrintMessage(f"Successfully applied {r}mm corner fillets to bridge block.\n")
+                break
+        except Exception:
+            pass
+        finally:
+            gc.collect()
+    bridge_block_pocketed.ViewObject.show()
+else:
+    bridge_block_pocketed.ViewObject.show()
+
+
+# --- STEP 3: HEADSTOCK OUTER FILLETS (2mm) ---
+if 'headstock_pocketed' in locals() and not headstock_pocketed.Shape.isNull(): 
+    headstock_edges_to_fillet = [] 
+    h_bounds = headstock_pocketed.Shape.BoundBox
+
+    for edge in headstock_pocketed.Shape.Edges: 
+        bbox = edge.BoundBox
+        
+        touches_interface = False 
+        for vertex in edge.Vertexes: 
+            if abs(vertex.Point.x - span_end_x) < epsilon: 
+                touches_interface = True 
+                break 
+        if touches_interface: 
+            
+            continue 
+
+        is_internal_x = (bbox.XMin > h_bounds.XMin + 1.5) and (bbox.XMax < h_bounds.XMax - 1.5)
+        is_internal_y = (bbox.YMin > h_bounds.YMin + 1.5) and (bbox.YMax < h_bounds.YMax - 1.5)
+        if is_internal_x and is_internal_y:
+            continue
+
+        headstock_edges_to_fillet.append(edge) 
+            
+    if headstock_edges_to_fillet: 
+        for r in [2.0, 1.0]:
+            try:
+                test_shape = headstock_pocketed.Shape.makeFillet(r, headstock_edges_to_fillet)
+                if test_shape and not test_shape.isNull() and test_shape.isValid() and test_shape.Volume > 0:
+                    headstock_pocketed.Shape = test_shape
+                    headstock_pocketed.Label = "FinalHeadstock"
+                    doc.recompute()
+                    App.Console.PrintMessage(f"Successfully applied {r}mm fillets to headstock.\n")
+                    break
+            except Exception:
+                pass
+            finally:
+                gc.collect()
+        headstock_pocketed.ViewObject.show()
+    else:
+        headstock_pocketed.ViewObject.show()
+
+# Ensure the fused instrument is visible, and hide separate parts
+if 'instrument_feature' in locals() and instrument_feature and instrument_feature.ViewObject:
+    instrument_feature.ViewObject.show()
+    if 'body_feature' in locals() and body_feature.ViewObject:
+        body_feature.ViewObject.hide()
+    if 'neck_pocketed' in locals() and neck_pocketed.ViewObject:
+        neck_pocketed.ViewObject.hide()
+else:
+    # Fallback to separate parts if fusion failed
+    if 'body_feature' in locals() and body_feature.ViewObject:
+        body_feature.ViewObject.show()
+    if 'neck_pocketed' in locals() and neck_pocketed.ViewObject:
+        neck_pocketed.ViewObject.show()
+
+# Final assembly recompute and pointer cleanup
+doc.recompute() 
+gc.collect()
+App.Console.PrintMessage("Macro processing successfully finished. Aluminum frame ready for assembly.\n")

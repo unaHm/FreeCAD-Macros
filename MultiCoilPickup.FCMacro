@@ -1,0 +1,116 @@
+import FreeCAD as App
+import Part
+
+# Clear existing document or create a new one
+doc = App.activeDocument()
+if not doc:
+    doc = App.newDocument("MultiCoilPickup6String")
+
+# ==========================================
+# PARAMETRIC CONFIGURATION (6-String Layout)
+# ==========================================
+enc_start_x = 40.0
+coil_width_j = 13.0
+coil_width_mm = 14.0
+
+center_row_e = 58.5   # J-Bridge Hybrid
+center_row_d = 76.4   # StingRay Rear
+center_row_c = 101.8  # StingRay Front
+center_row_b = 125.4  # P-Bass D/G (Strings 4-6: D, G, C)
+center_row_a = 154.0  # J-Neck / P-Bass E/A (Strings 1-3: B, E, A)
+
+enc_end_x = center_row_a + (coil_width_j / 2.0) + 10.0
+enc_total_length = enc_end_x - enc_start_x
+
+# Expanded for 6-string tracking + 6mm side margins
+enc_width = 112.0  # Centerline of pickup is at Y = 56.0
+enc_height = 19.0  
+wall_thickness = 1.5  
+
+# ==========================================
+# BUILD COMPONENTS
+# ==========================================
+outer_box = Part.makeBox(enc_total_length, enc_width, enc_height)
+outer_box.translate(App.Vector(enc_start_x, 0, 0))
+
+def create_pocket(center_x, width, y_min, y_max):
+    p_length = width + 0.3  # 0.3mm tolerance buffer
+    p_width = y_max - y_min
+    p_height = enc_height - wall_thickness
+    x_start = center_x - (p_length / 2.0)
+    
+    pocket = Part.makeBox(p_length, p_width, p_height)
+    pocket.translate(App.Vector(x_start, y_min, 0.0))
+    return pocket
+
+pockets = []
+
+# Split Coils (Row A & B) aligned to 6-string grouping
+# Total width 112mm. Center is 56mm. Outer margins stop 6mm from edge (Y=6 and Y=106)
+# Midpoint split leaves a 2mm center plastic wall between Y=55 and Y=57
+
+# Row A: J-Neck (Treble 3) & P Bass Bass-side (Low 3) (154.0mm)
+pockets.append(create_pocket(center_row_a, coil_width_j, 57, 106))  # Coil 2 (D, G, C strings)
+pockets.append(create_pocket(center_row_a, coil_width_j, 6, 55))    # Coil 1 (B, E, A strings)
+
+# Row B: P-Bass Treble-side Sweet Spot (125.4mm)
+pockets.append(create_pocket(center_row_b, coil_width_j, 57, 106))  # Coil 3 (D, G, C strings)
+
+# Full-Width Rows (Rows C, D, E) expand to cover the entire 6-string aperture (Y=6 to Y=106)
+pockets.append(create_pocket(center_row_c, coil_width_mm, 6, 106))  # Coil 4 (StingRay Front)
+pockets.append(create_pocket(center_row_d, coil_width_mm, 6, 106))  # Coil 5 (StingRay Rear)
+pockets.append(create_pocket(center_row_e, coil_width_j, 6, 106))   # Coil 6 (J-Bridge)
+
+combined_pockets = pockets[0]
+for p in pockets[1:]:
+    combined_pockets = combined_pockets.fuse(p)
+
+# Create the hollowed out shell base shape
+hollow_pickup = outer_box.cut(combined_pockets)
+
+# ==========================================
+# AUTOMATED FILLET PROCESSING
+# ==========================================
+vertical_edges = []
+tol = 0.001
+
+# Step 1: Apply vertical corner fillets (1.5mm)
+for edge in hollow_pickup.Edges:
+    if abs(edge.Vertexes[0].Point.x - edge.Vertexes[1].Point.x) < tol and \
+       abs(edge.Vertexes[0].Point.y - edge.Vertexes[1].Point.y) < tol:
+        
+        x_pt = edge.Vertexes[0].Point.x
+        y_pt = edge.Vertexes[0].Point.y
+        if (abs(x_pt - enc_start_x) < tol or abs(x_pt - enc_end_x) < tol) and \
+           (abs(y_pt - 0.0) < tol or abs(y_pt - enc_width) < tol):
+            vertical_edges.append(edge)
+
+if vertical_edges:
+    hollow_pickup = hollow_pickup.makeFillet(1.5, vertical_edges)
+
+# Step 2: Apply top rim fillets (1.0mm)
+top_edges = []
+for edge in hollow_pickup.Edges:
+    if abs(edge.Vertexes[0].Point.z - enc_height) < tol and \
+       abs(edge.Vertexes[1].Point.z - enc_height) < tol:
+        
+        x0, y0 = edge.Vertexes[0].Point.x, edge.Vertexes[0].Point.y
+        x1, y1 = edge.Vertexes[1].Point.x, edge.Vertexes[1].Point.y
+        
+        if (abs(y0 - 0.0) < tol or abs(y0 - enc_width) < tol or \
+            abs(x0 - enc_start_x) < tol or abs(x0 - enc_end_x) < tol) and \
+           (abs(y1 - 0.0) < tol or abs(y1 - enc_width) < tol or \
+            abs(x1 - enc_start_x) < tol or abs(x1 - enc_end_x) < tol):
+            top_edges.append(edge)
+
+if top_edges:
+    hollow_pickup = hollow_pickup.makeFillet(1.0, top_edges)
+
+# ==========================================
+# FINAL GENERATION
+# ==========================================
+pickup_obj = doc.addObject("Part::Feature", "Pickup_Shell_6String")
+pickup_obj.Shape = hollow_pickup
+
+doc.recompute()
+print("Success: Bottom-open 6-string parametric solid generated!")

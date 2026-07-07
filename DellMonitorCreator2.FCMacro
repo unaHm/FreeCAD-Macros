@@ -1,0 +1,194 @@
+import FreeCAD as App
+import Part
+from FreeCAD import Base
+import math
+
+# ==============================================================================
+# --- CONFIGURATION PARAMETERS (Page 13 Physical Specifications) ---
+# ==============================================================================
+MODEL = "P2214H"  # Change to "P2414H" to auto-scale workspace dimensions
+
+if MODEL == "P2414H":
+    MON_WIDTH  = 565.6   
+    MON_HEIGHT = 335.1   
+    MON_DEPTH  = 47.0    
+else:
+    MON_WIDTH  = 512.7   
+    MON_HEIGHT = 304.4   
+    MON_DEPTH  = 46.3    
+
+# --- GEOMETRIC PROFILES (Page 9 Reference Views) ---
+BEZEL_WIDTH = 18.0       # Front bezel framework boundary width
+SCREEN_INSET = 2.0       # Recess depth of active TFT glass panel
+CORNER_RADIUS = 6.0      # Fillet blend radius for outer chassis corners
+
+# Profile Step Targets
+BEZEL_FLAT_DEPTH = 12.7  # Total depth of the initial straight bezel edge
+INSET_STEP       = 2.0   # Per-side dimensional reduction (2mm inset on all sides)
+
+# Rear Flat VESA Platform
+VESA_PLATE_W = 140.0     # Flat rectangular width preserved for flush mount mating
+VESA_PLATE_H = 140.0     # Flat rectangular height preserved for flush mount mating
+VESA_SPACING = 100.0     # Standard VESA MIS-D 100x100mm mechanical grid
+
+# Rear Port Bay Cutout (Page 9 Shroud Interface)
+IO_WIDTH = 240.0         
+IO_HEIGHT = 65.0         
+IO_DEPTH = 22.0          
+
+# ==============================================================================
+# --- ENVIRONMENT SETUP ---
+# ==============================================================================
+doc_name = f"Dell_{MODEL}_True_Shoulder_Inset"
+doc = App.newDocument(doc_name)
+
+# ------------------------------------------------------------------------------
+# 1. GENERATE SKETCH 1: TOP VIEW PROFILE WITH UNIFORM INSET (Y-Axis Extrusion)
+# ------------------------------------------------------------------------------
+w_half = MON_WIDTH / 2.0
+v_w_half = VESA_PLATE_W / 2.0
+w_inset = w_half - INSET_STEP  # Shrunk by 2mm on each side
+
+top_edges = []
+
+# Front face and outer bezel side wall up to 12.7mm depth
+top_edges.append(Part.LineSegment(App.Base.Vector(-w_half, 0, 0), App.Base.Vector(-w_half, 0, -BEZEL_FLAT_DEPTH)).toShape())
+
+# Sharp 2mm step inward at the 12.7mm line (Creating the shoulder)
+top_edges.append(Part.LineSegment(App.Base.Vector(-w_half, 0, -BEZEL_FLAT_DEPTH), App.Base.Vector(-w_inset, 0, -BEZEL_FLAT_DEPTH)).toShape())
+
+# Convex Back Panel Curve: Begins smoothly exactly from the inset shoulder position
+left_curve = Part.BezierCurve()
+left_curve.setPoles([
+    App.Base.Vector(-w_inset, 0, -BEZEL_FLAT_DEPTH),
+    App.Base.Vector(-w_inset + 40.0, 0, -MON_DEPTH + 2.0), # Tangent control
+    App.Base.Vector(-v_w_half, 0, -MON_DEPTH)
+])
+top_edges.append(left_curve.toShape())
+
+# Flat central VESA mounting plane
+top_edges.append(Part.LineSegment(App.Base.Vector(-v_w_half, 0, -MON_DEPTH), App.Base.Vector(v_w_half, 0, -MON_DEPTH)).toShape())
+
+# Right Convex Back Panel Curve (Symmetrical Mirror)
+right_curve = Part.BezierCurve()
+right_curve.setPoles([
+    App.Base.Vector(v_w_half, 0, -MON_DEPTH),
+    App.Base.Vector(w_inset - 40.0, 0, -MON_DEPTH + 2.0),  # Tangent control
+    App.Base.Vector(w_inset, 0, -BEZEL_FLAT_DEPTH)
+])
+top_edges.append(right_curve.toShape())
+
+# Right side shoulder step and outer bezel tracking back to front surface
+top_edges.append(Part.LineSegment(App.Base.Vector(w_inset, 0, -BEZEL_FLAT_DEPTH), App.Base.Vector(w_half, 0, -BEZEL_FLAT_DEPTH)).toShape())
+top_edges.append(Part.LineSegment(App.Base.Vector(w_half, 0, -BEZEL_FLAT_DEPTH), App.Base.Vector(w_half, 0, 0)).toShape())
+top_edges.append(Part.LineSegment(App.Base.Vector(w_half, 0, 0), App.Base.Vector(-w_half, 0, 0)).toShape())
+
+top_wire = Part.Wire(top_edges)
+top_face = Part.Face(top_wire)
+
+# Extrude and center over the full display height space
+top_sketch_extrusion = top_face.extrude(App.Base.Vector(0, MON_HEIGHT, 0))
+top_sketch_extrusion.translate(App.Base.Vector(0, -MON_HEIGHT/2.0, 0))
+
+# ------------------------------------------------------------------------------
+# 2. GENERATE SKETCH 2: SIDE VIEW PROFILE WITH UNIFORM INSET (X-Axis Extrusion)
+# ------------------------------------------------------------------------------
+h_half = MON_HEIGHT / 2.0
+v_h_half = VESA_PLATE_H / 2.0
+h_inset = h_half - INSET_STEP  # Shrunk by 2mm on each side
+
+side_edges = []
+
+# Front face and outer bottom bezel side wall up to 12.7mm depth
+side_edges.append(Part.LineSegment(App.Base.Vector(0, -h_half, 0), App.Base.Vector(0, -h_half, -BEZEL_FLAT_DEPTH)).toShape())
+
+# Bottom sharp 2mm step inward at the 12.7mm line (Creating the shoulder)
+side_edges.append(Part.LineSegment(App.Base.Vector(0, -h_half, -BEZEL_FLAT_DEPTH), App.Base.Vector(0, -h_inset, -BEZEL_FLAT_DEPTH)).toShape())
+
+# Bottom Convex Back Panel Curve: Begins smoothly exactly from the inset shoulder position
+bottom_curve = Part.BezierCurve()
+bottom_curve.setPoles([
+    App.Base.Vector(0, -h_inset, -BEZEL_FLAT_DEPTH),
+    App.Base.Vector(0, -h_inset + 30.0, -MON_DEPTH + 2.0), # Tangent control
+    App.Base.Vector(0, -v_h_half, -MON_DEPTH)
+])
+side_edges.append(bottom_curve.toShape())
+
+# Flat central VESA mounting plane (Vertical profile)
+side_edges.append(Part.LineSegment(App.Base.Vector(0, -v_h_half, -MON_DEPTH), App.Base.Vector(0, v_h_half, -MON_DEPTH)).toShape())
+
+# Top Convex Back Panel Curve
+top_curve = Part.BezierCurve()
+top_curve.setPoles([
+    App.Base.Vector(0, v_h_half, -MON_DEPTH),
+    App.Base.Vector(0, h_inset - 30.0, -MON_DEPTH + 2.0),  # Tangent control
+    App.Base.Vector(0, h_inset, -BEZEL_FLAT_DEPTH)
+])
+side_edges.append(top_curve.toShape())
+
+# Top side shoulder step and outer bezel tracking back to front surface
+side_edges.append(Part.LineSegment(App.Base.Vector(0, h_inset, -BEZEL_FLAT_DEPTH), App.Base.Vector(0, h_half, -BEZEL_FLAT_DEPTH)).toShape())
+side_edges.append(Part.LineSegment(App.Base.Vector(0, h_half, -BEZEL_FLAT_DEPTH), App.Base.Vector(0, h_half, 0)).toShape())
+side_edges.append(Part.LineSegment(App.Base.Vector(0, h_half, 0), App.Base.Vector(0, -h_half, 0)).toShape())
+
+side_wire = Part.Wire(side_edges)
+side_face = Part.Face(side_wire)
+
+# Extrude and center across the full display width space
+side_sketch_extrusion = side_face.extrude(App.Base.Vector(MON_WIDTH, 0, 0))
+side_sketch_extrusion.translate(App.Base.Vector(-MON_WIDTH/2.0, 0, 0))
+
+# ------------------------------------------------------------------------------
+# 3. INTERSECTION: SMOOTH STEPPED COMPOUND CURVED CHASSIS VAULT
+# ------------------------------------------------------------------------------
+chassis = top_sketch_extrusion.common(side_sketch_extrusion)
+
+# Apply global cabinet vertical edge blends matching corner radius specifications
+vertical_edges = []
+for edge in chassis.Edges:
+    if hasattr(edge.Curve, 'Direction') and abs(edge.Curve.Direction.z) > 0.99:
+        if abs(edge.CenterOfMass.x) > (w_half - 10.0) or abs(edge.CenterOfMass.y) > (h_half - 10.0):
+            vertical_edges.append(edge)
+
+if vertical_edges:
+    chassis = chassis.makeFillet(CORNER_RADIUS, vertical_edges)
+
+# ------------------------------------------------------------------------------
+# 4. SUBTRACTIVE ACTIVE PANEL RECESSED SCREEN (Front Profile Cutout)
+# ------------------------------------------------------------------------------
+screen_w = MON_WIDTH - (BEZEL_WIDTH * 2)
+screen_h = MON_HEIGHT - (BEZEL_WIDTH * 2)
+screen_cut = Part.makeBox(screen_w, screen_h, SCREEN_INSET + 0.1)
+screen_cut.translate(App.Base.Vector(-screen_w/2.0, -screen_h/2.0, -SCREEN_INSET))
+chassis = chassis.cut(screen_cut)
+
+# ------------------------------------------------------------------------------
+# 5. SUBTRACTIVE REAR I/O CONNECTOR POCKET (Page 9 Shroud Interface)
+# ------------------------------------------------------------------------------
+io_cut = Part.makeBox(IO_WIDTH, IO_HEIGHT, IO_DEPTH + 0.1)
+io_cut.translate(App.Base.Vector(-IO_WIDTH/2.0, -(MON_HEIGHT * 0.18) - (IO_HEIGHT/2.0), -MON_DEPTH - 0.05))
+chassis = chassis.cut(io_cut)
+
+# ------------------------------------------------------------------------------
+# 6. SUBTRACTIVE VESA 100x100mm MECHANICAL HARDWARE ARRAY
+# ------------------------------------------------------------------------------
+half_v = VESA_SPACING / 2.0
+for x_sign in [-1, 1]:
+    for y_sign in [-1, 1]:
+        hole_x = x_sign * half_v
+        hole_y = y_sign * half_v
+        
+        bolt_center = App.Base.Vector(hole_x, hole_y, -MON_DEPTH - 0.1)
+        bolt_dir = App.Base.Vector(0, 0, 1)
+        
+        hole_cyl = Part.makeCylinder(2.25, MON_DEPTH + 0.2, bolt_center, bolt_dir)
+        chassis = chassis.cut(hole_cyl)
+
+# ==============================================================================
+# --- RENDER OUTPUT STAGE ---
+# ==============================================================================
+mesh_obj = doc.addObject("Part::Feature", f"Dell_{MODEL}_True_Step_Monitor")
+mesh_obj.Shape = chassis
+
+doc.recompute()
+App.Console.PrintMessage(f"Successfully rendered uniform stepped Dell {MODEL} monitor shell.\n")
