@@ -1,0 +1,1 @@
+After getting used to building 3d models with OpenSCAD, but having trouble with the CSG method of rendering, I wanted to take that programmatic mindset and build models in FreeCAD, where I could use BREP methods for more engineering-style scenarios.
