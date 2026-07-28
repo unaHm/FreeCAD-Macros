@@ -1,0 +1,1057 @@
+import FreeCAD as App
+import Part
+import importSVG
+import os
+import Draft
+import math
+import gc
+
+doc = App.activeDocument()
+if not doc:
+    doc = App.newDocument("SwainyBass_Assembly")
+
+existing_objects = set(doc.Objects)
+
+# ==========================================
+# --- 0. PREFERENCES & CONFIGURATION -------
+# ==========================================
+draft_prefs = App.ParamGet("User parameter:BaseApp/Preferences/Mod/Draft")
+draft_prefs.SetFloat("importSVGScale", 1.0)        # Force 1:1 scale
+draft_prefs.SetFloat("svgDiscretization", 0.05)    # Smooth curve discretization
+
+is_left_handed = True  
+side_multiplier = -1 if is_left_handed else 1
+
+# Carbon Fiber wrap allowance (in mm)
+cf_wrap_thickness = 1.2  # Set to 0.0 for un-shrunk core
+
+# 3D Printing Fit Clearance Offset (0.25mm per side = 0.5mm overall clearance)
+print_clearance = 0.25 
+
+FILES = {
+    "body_contour": "/home/dan/Downloads/swainybass-2026-07-body.svg",
+    "headstock": "/home/dan/Downloads/swainybass-2026-06-headstock-complete.svg",
+    "cavity": "/home/dan/Downloads/swainybass-2026-06-cavity.svg",
+    "cavity_flange": "/home/dan/Downloads/swainybass-2026-06-cavityflange.svg",
+    "pot_holes": "/home/dan/Downloads/swainybass-2026-06-through-holes.svg"
+}
+
+scale_length = 864.0
+epsilon = 0.005 
+
+# Core reference landmarks
+span_end_x = scale_length
+neck_length = (0.75 * scale_length) + 5.0  # 653.0 mm
+neck_stop_x = span_end_x - neck_length     # 211.0 mm (Heel interface)
+
+controls_y = -100.0 * side_multiplier
+
+# M5 Body-to-Core Attachment Screw Landmarks (X = 165mm clears belly scoop)
+m5_screw_x_coords = [10.0, 165.0]
+m5_screw_y_coords = [-25.0, 25.0]
+
+# ==========================================
+# --- 1. GEOMETRY HELPER FUNCTIONS ---------
+# ==========================================
+
+def get_circle_properties(shape):
+    for edge in shape.Edges:
+        try:
+            curve = edge.Curve
+            if hasattr(curve, "Center") and hasattr(curve, "Radius"):
+                curve_name = type(curve).__name__
+                if "Circle" in curve_name or "ArcOfCircle" in curve_name:
+                    return curve.Radius, curve.Center
+        except Exception:
+            pass
+    bbox = shape.BoundBox
+    cx = (bbox.XMax + bbox.XMin) / 2.0
+    cy = (bbox.YMax + bbox.YMin) / 2.0
+    rx = (bbox.XMax - bbox.XMin) / 2.0
+    ry = (bbox.YMax - bbox.YMin) / 2.0
+    return (rx + ry) / 2.0, App.Vector(cx, cy, bbox.Center.z)
+
+
+def create_svg_solid(filepath, thickness, name, doc, offset_amount=0.0):
+    if not os.path.exists(filepath):
+        App.Console.PrintWarning(f"File not found at {filepath}\n")
+        return None
+
+    old_objs = set(doc.Objects)
+    try:
+        importSVG.insert(filepath, doc.Name)
+        doc.recompute()
+    except Exception as e:
+        App.Console.PrintError(f"Failed to import {name} SVG: {str(e)}\n")
+        return None
+    
+    new_objs = [obj for doc_obj in [doc] for obj in doc_obj.Objects if obj not in old_objs]
+    if not new_objs:
+        return None
+
+    in_memory_shape = None
+    try:
+        if hasattr(Draft, "make_sketch"):
+            sketch = Draft.make_sketch(new_objs, autoconstraints=True)
+        else:
+            sketch = Draft.makeSketch(new_objs, autoconstraints=True)
+            
+        doc.recompute()
+        
+        extrude = doc.addObject("Part::Extrusion", "TempExtrude")
+        extrude.Base = sketch
+        extrude.Dir = App.Vector(0, 0, thickness)
+        extrude.Solid = True
+        doc.recompute()
+        
+        in_memory_shape = extrude.Shape.copy()
+
+        if abs(offset_amount) > 0.001 and in_memory_shape:
+            try:
+                face = in_memory_shape.Faces[0]
+                wire = face.OuterWire
+                shrunk_wire = wire.makeOffset2D(-offset_amount)
+                shrunk_face = Part.Face(shrunk_wire)
+                in_memory_shape = shrunk_face.extrude(App.Vector(0, 0, thickness))
+            except Exception as offset_err:
+                App.Console.PrintWarning(f"SVG 2D offset failed for {name}: {str(offset_err)}\n")
+
+    except Exception as e:
+        App.Console.PrintError(f"Failed to build solid for {name}: {str(e)}\n")
+
+    all_new = [obj for doc_obj in [doc] for obj in doc_obj.Objects if obj not in old_objs]
+    for obj in all_new:
+        try: doc.removeObject(obj.Name)
+        except Exception: pass
+    doc.recompute()
+    
+    return in_memory_shape
+
+
+def create_semi_ellipse_wire(x, y_center, width, thickness, z_top=17.0):
+    ry = width / 2.0
+    rz = thickness
+    num_points = 12 
+    arc_points = []
+    for i in range(num_points + 1):
+        theta = math.pi + (i / float(num_points)) * math.pi
+        curr_y = y_center + ry * math.cos(theta)
+        curr_z = z_top + rz * math.sin(theta)
+        arc_points.append(App.Vector(x, curr_y, curr_z))
+    
+    try:
+        curve = Part.BSplineCurve()
+        curve.interpolate(arc_points)
+        curve_edge = curve.toShape()
+        flat_edge = Part.makeLine(arc_points[-1], arc_points[0])
+        return Part.Wire([curve_edge, flat_edge])
+    except Exception:
+        polygon_points = arc_points + [arc_points[0]]
+        return Part.makePolygon(polygon_points)
+
+
+def create_asymmetric_rectangle_wire(x, y_min, y_max, thickness, z_top=17.0):
+    p1 = App.Vector(x, y_min, z_top)          
+    p2 = App.Vector(x, y_min, z_top - thickness)     
+    p3 = App.Vector(x, y_max, z_top - thickness)     
+    p4 = App.Vector(x, y_max, z_top)          
+    return Part.makePolygon([p1, p2, p3, p4, p1])
+
+
+def create_fretboard_radiused_wire(x, y_center, width, thickness=7.0, z_bottom=17.0, radius=500.0):
+    """Creates a crowned profile wire for the fretboard using a 500mm radius."""
+    ry = width / 2.0
+    z_peak = z_bottom + thickness
+    z_center_circle = z_peak - radius
+    
+    z_edge = z_center_circle + math.sqrt(radius**2 - ry**2)
+    
+    p_start = App.Vector(x, y_center - ry, z_edge)
+    p_mid = App.Vector(x, y_center, z_peak)
+    p_end = App.Vector(x, y_center + ry, z_edge)
+    
+    p_bot_right = App.Vector(x, y_center + ry, z_bottom)
+    p_bot_left = App.Vector(x, y_center - ry, z_bottom)
+    
+    arc = Part.Arc(p_start, p_mid, p_end)
+    arc_edge = arc.toShape()
+    
+    edge_right = Part.makeLine(p_end, p_bot_right)
+    edge_bottom = Part.makeLine(p_bot_right, p_bot_left)
+    edge_left = Part.makeLine(p_bot_left, p_start)
+    
+    wire = Part.Wire([arc_edge, edge_right, edge_bottom, edge_left])
+    return wire
+
+
+def create_curved_slot_cutter(x, y_center, width, slot_width=0.6, slot_depth=1.5, radius=500.0):
+    """Generates a concentric curved cylinder solid to cut slots with uniform luthier-depth."""
+    ry = (width + 10.0) / 2.0
+    z_center_circle = 24.0 - radius
+    
+    r_top = radius + 1.0  
+    r_bot = radius - slot_depth  
+    
+    z_top_edge = z_center_circle + math.sqrt(r_top**2 - ry**2)
+    z_bot_edge = z_center_circle + math.sqrt(r_bot**2 - ry**2)
+    
+    p_top_start = App.Vector(x, y_center - ry, z_top_edge)
+    p_top_mid = App.Vector(x, y_center, z_center_circle + r_top)
+    p_top_end = App.Vector(x, y_center + ry, z_top_edge)
+    
+    p_bot_start = App.Vector(x, y_center - ry, z_bot_edge)
+    p_bot_mid = App.Vector(x, y_center, z_center_circle + r_bot)
+    p_bot_end = App.Vector(x, y_center + ry, z_bot_edge)
+    
+    arc_top = Part.Arc(p_top_start, p_top_mid, p_top_end).toShape()
+    arc_bot = Part.Arc(p_bot_end, p_bot_mid, p_bot_start).toShape()
+    
+    edge_right = Part.makeLine(p_top_end, p_bot_end)
+    edge_left = Part.makeLine(p_bot_start, p_top_start)
+    
+    wire = Part.Wire([arc_top, edge_right, arc_bot, edge_left])
+    face = Part.Face(wire)
+    solid = face.extrude(App.Vector(slot_width, 0, 0))
+    solid.translate(App.Vector(-slot_width / 2.0, 0, 0))
+    return solid
+
+
+def create_ramp_wire(x, y_center, width, thickness=8.0, z_bottom=11.0, radius=500.0):
+    """Creates a crowned profile wire for the finger ramp using a 500mm radius."""
+    ry = width / 2.0
+    z_peak = z_bottom + thickness
+    z_center_circle = z_peak - radius
+    
+    z_edge = z_center_circle + math.sqrt(radius**2 - ry**2)
+    
+    p_start = App.Vector(x, y_center - ry, z_edge)
+    p_mid = App.Vector(x, y_center, z_peak)
+    p_end = App.Vector(x, y_center + ry, z_edge)
+    
+    p_bot_right = App.Vector(x, y_center + ry, z_bottom)
+    p_bot_left = App.Vector(x, y_center - ry, z_bottom)
+    
+    arc = Part.Arc(p_start, p_mid, p_end)
+    arc_edge = arc.toShape()
+    
+    edge_right = Part.makeLine(p_end, p_bot_right)
+    edge_bottom = Part.makeLine(p_bot_right, p_bot_left)
+    edge_left = Part.makeLine(p_bot_left, p_start)
+    
+    wire = Part.Wire([arc_edge, edge_right, edge_bottom, edge_left])
+    return wire
+
+
+# ==========================================
+# --- 2. IMPORT & SECTION HEADSTOCK SVG ----
+# ==========================================
+headstock_svg_face = None
+tuner_cutters = []
+outer_wire = None
+
+try:
+    importSVG.insert(FILES["headstock"], doc.Name)
+    doc.recompute() 
+except Exception as e:
+    App.Console.PrintError(f"Failed to import Headstock SVG: {str(e)}\n") 
+
+new_objects = [obj for doc_obj in [doc] for obj in doc_obj.Objects if obj not in existing_objects] 
+svg_geometry = [obj for obj in new_objects if hasattr(obj, 'Shape') and not obj.Shape.isNull()] 
+
+headstock_top_y = 30.0   
+headstock_bottom_y = -30.0 
+
+if svg_geometry:
+    headstock_contour = None
+    tuner_holes = []
+    max_hs_area = 0.0
+
+    for obj in svg_geometry:
+        if hasattr(obj, "Shape") and not obj.Shape.isNull():
+            bbox = obj.Shape.BoundBox
+            area = (bbox.XMax - bbox.XMin) * (bbox.YMax - bbox.YMin)
+            if area > max_hs_area:
+                if headstock_contour:
+                    tuner_holes.append(headstock_contour)
+                max_hs_area = area
+                headstock_contour = obj
+            else:
+                tuner_holes.append(obj)
+
+    if headstock_contour:
+        hs_outer_shape = headstock_contour.Shape.copy()
+        bounds = hs_outer_shape.BoundBox 
+        
+        target_x = scale_length - bounds.XMin 
+        target_y = 0.0 - bounds.Center.y
+        hs_outer_shape.translate(App.Vector(target_x, target_y, 0))
+
+        outer_wire = hs_outer_shape.OuterWire if hasattr(hs_outer_shape, "OuterWire") and hs_outer_shape.OuterWire else hs_outer_shape.Wires[0]
+        headstock_svg_face = Part.Face(outer_wire)
+        
+        nut_y_coords = [v.Point.y for v in headstock_svg_face.Vertexes if abs(v.Point.x - scale_length) < 2.0]
+        if nut_y_coords:
+            headstock_top_y = max(nut_y_coords)
+            headstock_bottom_y = min(nut_y_coords)
+
+        for hole_obj in tuner_holes:
+            try:
+                r, center = get_circle_properties(hole_obj.Shape)
+                cyl = Part.makeCylinder(r, 40.0, App.Vector(center.x + target_x, center.y + target_y, -10.0), App.Vector(0, 0, 1))
+                tuner_cutters.append(cyl)
+            except Exception:
+                pass
+
+    for obj in svg_geometry:
+        try: doc.removeObject(obj.Name)
+        except Exception: pass
+
+width_headstock_nut = headstock_top_y - headstock_bottom_y
+center_y = (headstock_top_y + headstock_bottom_y) / 2.0
+
+
+# ==========================================
+# --- 3. BUILD STRUCTURAL CORE -------------
+# ==========================================
+
+bridge_start_x = -30.0
+bridge_end_x = neck_stop_x  # X = 211.0mm
+
+bridge_core_width = 110.0
+bridge_core_height = 30.0  
+
+# Z Reference Planes (Full-Scale Baseline)
+z_neck_top = 17.0
+cap_thickness = 4.0
+z_step_interface = z_neck_top - cap_thickness  # Z = 13.0mm
+z_bridge_bottom = z_step_interface - bridge_core_height  # Z = -17.0mm
+
+width_heel = 90.0 
+thickness_heel = 24.5  
+
+# Wire profile for neck heel joint
+wire_neck_heel_full = create_semi_ellipse_wire(neck_stop_x, center_y, width_heel, thickness_heel, z_top=z_neck_top)
+
+# --- 3.1 VERTICAL-WALL TRANSITION (FULL SCALE) ---
+bridge_block_solid = None
+try:
+    taper_start_x = bridge_start_x + 80.0  # X = 50.0mm
+    
+    bridge_block_solid = Part.makeBox(
+        bridge_end_x - bridge_start_x, 
+        bridge_core_width, 
+        bridge_core_height, 
+        App.Vector(bridge_start_x, -bridge_core_width / 2.0, z_bridge_bottom)
+    )
+    
+    y_full = bridge_core_width / 2.0      
+    y_heel = width_heel / 2.0             
+    
+    poly_top = Part.makePolygon([
+        App.Vector(taper_start_x, y_full, z_bridge_bottom - 2.0),
+        App.Vector(neck_stop_x + 5.0, y_full, z_bridge_bottom - 2.0),
+        App.Vector(neck_stop_x + 5.0, y_heel, z_bridge_bottom - 2.0),
+        App.Vector(taper_start_x, y_full, z_bridge_bottom - 2.0)
+    ])
+    cutter_top = Part.Face(poly_top).extrude(App.Vector(0, 0, bridge_core_height + 10.0))
+    
+    poly_bot = Part.makePolygon([
+        App.Vector(taper_start_x, -y_full, z_bridge_bottom - 2.0),
+        App.Vector(neck_stop_x + 5.0, -y_full, z_bridge_bottom - 2.0),
+        App.Vector(neck_stop_x + 5.0, -y_heel, z_bridge_bottom - 2.0),
+        App.Vector(taper_start_x, -y_full, z_bridge_bottom - 2.0)
+    ])
+    cutter_bot = Part.Face(poly_bot).extrude(App.Vector(0, 0, bridge_core_height + 10.0))
+    
+    bridge_block_solid = bridge_block_solid.cut(Part.makeCompound([cutter_top, cutter_bot]))
+
+    # Apply relief filleting to full-scale bridge block
+    bridge_relief_edges = []
+    for edge in bridge_block_solid.Edges:
+        bbox = edge.BoundBox
+        is_bottom_edge = abs(bbox.ZMin - z_bridge_bottom) < 0.1 and abs(bbox.ZMax - z_bridge_bottom) < 0.1
+        is_vertical_corner = abs(bbox.ZMax - bbox.ZMin) > (bridge_core_height - 1.0) and (bbox.XMin < (bridge_start_x + 2.0) or abs(bbox.XMax - neck_stop_x) < 2.0)
+        if is_bottom_edge or is_vertical_corner:
+            bridge_relief_edges.append(edge)
+
+    if bridge_relief_edges:
+        for r_bridge in [3.0, 2.0, 1.0]:
+            try:
+                temp_bridge = bridge_block_solid.makeFillet(r_bridge, bridge_relief_edges)
+                if temp_bridge and temp_bridge.isValid() and temp_bridge.Volume > 0:
+                    bridge_block_solid = temp_bridge
+                    break
+            except Exception:
+                pass
+
+except Exception as trans_err:
+    App.Console.PrintError(f"Vertical transition build failed: {str(trans_err)}\n")
+
+# --- 3.2 ASYMMETRICALLY MATCHED VOLUTE TRANSITION ---
+x_volute_end = span_end_x + 20.0  # X = 884.0mm
+
+wire_nut_ellipse = create_semi_ellipse_wire(span_end_x, center_y, width_headstock_nut, 17.0, z_top=z_neck_top)
+neck_playing_solid = Part.makeLoft([wire_neck_heel_full, wire_nut_ellipse], True)
+
+headstock_body = headstock_svg_face.extrude(App.Vector(0, 0, 17.0))
+trim_back = Part.makeBox(
+    100.0, 300.0, 100.0,
+    App.Vector(x_volute_end - 100.0, -150.0, -50.0)
+)
+headstock_body = headstock_body.cut(trim_back)
+
+y_min_hs = -36.0  
+y_max_hs = 36.0
+
+if headstock_body and headstock_body.Vertexes:
+    target_vertices_y = [
+        v.Point.y for v in headstock_body.Vertexes 
+        if abs(v.Point.x - x_volute_end) < 1.0
+    ]
+    if target_vertices_y:
+        y_min_hs = min(target_vertices_y)
+        y_max_hs = max(target_vertices_y)
+
+wire_hs_section = create_asymmetric_rectangle_wire(
+    x_volute_end, y_min_hs, y_max_hs, 17.0, z_top=z_neck_top
+)
+volute_transition = Part.makeLoft([wire_nut_ellipse, wire_hs_section], True)
+
+# Full-scale un-cut core blank reference (Used for carving the body shell pocket)
+full_scale_core_blank = bridge_block_solid.fuse(neck_playing_solid).fuse(volute_transition).fuse(headstock_body)
+
+try:
+    seam_edges = []
+    for edge in full_scale_core_blank.Edges:
+        bbox = edge.BoundBox
+        is_seam_x = abs(bbox.Center.x - span_end_x) < 2.0 or abs(bbox.Center.x - x_volute_end) < 2.0
+        if is_seam_x and bbox.ZMax < (z_neck_top - 0.1):
+            seam_edges.append(edge)
+
+    if seam_edges:
+        for r_fillet in [12.0, 10.0, 8.0, 6.0, 4.0, 2.0]:
+            try:
+                temp_solid = full_scale_core_blank.makeFillet(r_fillet, seam_edges)
+                if temp_solid and temp_solid.isValid() and temp_solid.Volume > 0:
+                    full_scale_core_blank = temp_solid
+                    break
+            except Exception:
+                pass
+except Exception as seam_err:
+    App.Console.PrintWarning(f"Volute seam filleting bypassed: {str(seam_err)}\n")
+
+if tuner_cutters:
+    full_scale_core_blank = full_scale_core_blank.cut(Part.makeCompound(tuner_cutters))
+
+# --- 3.3 CONSTRUCT TAPERED SHRUNK CORE FOR STRUCTURAL CORE OUTPUT ---
+if cf_wrap_thickness > 0.0:
+    w_heel_s = width_heel - (2.0 * cf_wrap_thickness)
+    t_heel_s = thickness_heel - (2.0 * cf_wrap_thickness)
+    w_nut_s = width_headstock_nut - (2.0 * cf_wrap_thickness)
+    z_top_s = z_neck_top - cf_wrap_thickness
+
+    wire_heel_s = create_semi_ellipse_wire(neck_stop_x, center_y, w_heel_s, t_heel_s, z_top=z_top_s)
+    wire_nut_s = create_semi_ellipse_wire(span_end_x, center_y, w_nut_s, 17.0 - cf_wrap_thickness, z_top=z_top_s)
+    neck_s_solid = Part.makeLoft([wire_heel_s, wire_nut_s], True)
+
+    w_bridge_s = bridge_core_width - (2.0 * cf_wrap_thickness)
+    h_bridge_s = bridge_core_height - (2.0 * cf_wrap_thickness)
+    z_bridge_bot_s = z_step_interface - h_bridge_s
+
+    bridge_s_solid = Part.makeBox(
+        bridge_end_x - bridge_start_x, w_bridge_s, h_bridge_s,
+        App.Vector(bridge_start_x, -w_bridge_s / 2.0, z_bridge_bot_s)
+    )
+
+    y_full_s = w_bridge_s / 2.0
+    y_heel_s = w_heel_s / 2.0
+    
+    poly_top_s = Part.makePolygon([
+        App.Vector(taper_start_x, y_full_s, z_bridge_bot_s - 2.0),
+        App.Vector(neck_stop_x + 5.0, y_full_s, z_bridge_bot_s - 2.0),
+        App.Vector(neck_stop_x + 5.0, y_heel_s, z_bridge_bot_s - 2.0),
+        App.Vector(taper_start_x, y_full_s, z_bridge_bot_s - 2.0)
+    ])
+    cutter_top_s = Part.Face(poly_top_s).extrude(App.Vector(0, 0, h_bridge_s + 10.0))
+
+    poly_bot_s = Part.makePolygon([
+        App.Vector(taper_start_x, -y_full_s, z_bridge_bot_s - 2.0),
+        App.Vector(neck_stop_x + 5.0, -y_full_s, z_bridge_bot_s - 2.0),
+        App.Vector(neck_stop_x + 5.0, -y_heel_s, z_bridge_bot_s - 2.0),
+        App.Vector(taper_start_x, -y_full_s, z_bridge_bot_s - 2.0)
+    ])
+    cutter_bot_s = Part.Face(poly_bot_s).extrude(App.Vector(0, 0, h_bridge_s + 10.0))
+
+    bridge_s_solid = bridge_s_solid.cut(Part.makeCompound([cutter_top_s, cutter_bot_s]))
+
+    hs_body_s = headstock_svg_face.extrude(App.Vector(0, 0, 17.0))
+    if outer_wire:
+        try:
+            hs_offset = outer_wire.makeOffset2D(-cf_wrap_thickness)
+            if hs_offset and hs_offset.Edges:
+                hs_body_s = Part.Face(hs_offset).extrude(App.Vector(0, 0, 17.0 - (2.0 * cf_wrap_thickness)))
+                hs_body_s.translate(App.Vector(0, 0, cf_wrap_thickness))
+        except Exception:
+            pass
+
+    hs_body_s = hs_body_s.cut(trim_back)
+    wire_hs_s = create_asymmetric_rectangle_wire(x_volute_end, y_min_hs + cf_wrap_thickness, y_max_hs - cf_wrap_thickness, 17.0 - cf_wrap_thickness, z_top=z_top_s)
+    volute_s = Part.makeLoft([wire_nut_s, wire_hs_s], True)
+
+    shrunk_core_blank = bridge_s_solid.fuse(neck_s_solid).fuse(volute_s).fuse(hs_body_s)
+    if tuner_cutters:
+        shrunk_core_blank = shrunk_core_blank.cut(Part.makeCompound(tuner_cutters))
+    structural_core = shrunk_core_blank
+else:
+    structural_core = full_scale_core_blank.copy()
+
+# --- 3.4 APPLY SUBTRACTIVE FEATURES TO CORE ---
+node_radius = 2.1
+hole_depth = 25.0   
+x_positions = [-15.0, 15.0]  
+y_positions = [-45.0, -27.0, -9.0, 9.0, 27.0, 45.0]  
+
+hole_shapes = [
+    Part.makeCylinder(node_radius, hole_depth, App.Vector(x, y, z_step_interface), App.Vector(0, 0, -1))
+    for x in x_positions for y in y_positions
+]
+structural_core = structural_core.cut(Part.makeCompound(hole_shapes))
+
+# --- CARBON FIBER REINFORCEMENT ROD CHANNELS (Y-OFFSET REDUCED TO 15mm) ---
+# Twin 6.35mm x 10.02mm slots positioned closer to the centerline
+cf_rod_length = 625.0  # X = 215.0mm to X = 840.0mm
+cf_rod_width = 6.35
+cf_rod_depth = 9.52 + 0.50  # 10.02mm depth accounts for epoxy glue line
+cf_y_offset = 15.0  # Tightened from 18.0mm to prevent cutting through neck carve
+
+cf_channel_left = Part.makeBox(
+    cf_rod_length, cf_rod_width, cf_rod_depth,
+    App.Vector(215.0, center_y - cf_y_offset - (cf_rod_width / 2.0), z_neck_top - cf_rod_depth)
+)
+
+cf_channel_right = Part.makeBox(
+    cf_rod_length, cf_rod_width, cf_rod_depth,
+    App.Vector(215.0, center_y + cf_y_offset - (cf_rod_width / 2.0), z_neck_top - cf_rod_depth)
+)
+
+structural_core = structural_core.cut(Part.makeCompound([cf_channel_left, cf_channel_right]))
+App.Console.PrintMessage("Successfully cut Carbon Fiber channels (15mm Y-offset, 10.02mm depth) into Core.\n")
+
+# Truss Rod Channel and Pocket Cutters
+truss_rod_cutter = Part.makeBox(
+    610.0, 6.35, 11.52, 
+    App.Vector(neck_stop_x, center_y - 6.35 / 2.0, z_neck_top - 9.52)
+)
+
+truss_rod_nut_pocket = Part.makeBox(
+    35.5, 10.0, 10.0,
+    App.Vector(neck_stop_x, center_y - 10.0 / 2.0, z_neck_top - 10.0)
+)
+
+access_cutter = Part.makeBox(
+    30.0, 10.0, 14.0, 
+    App.Vector(neck_stop_x - 30.0, center_y - 10.0 / 2.0, z_neck_top - 12.0)
+)
+
+truss_cutters_compound = Part.makeCompound([truss_rod_cutter, truss_rod_nut_pocket, access_cutter])
+structural_core = structural_core.cut(truss_cutters_compound)
+
+# M5 Threaded Insert Pilot Holes in Core (Bottom Surface, 4.2mm Diameter x 12.0mm Depth)
+m5_core_pilot_holes = []
+for mx in m5_screw_x_coords:
+    for my in m5_screw_y_coords:
+        cyl = Part.makeCylinder(2.1, 12.0, App.Vector(mx, my * side_multiplier, z_bridge_bottom), App.Vector(0, 0, 1))
+        m5_core_pilot_holes.append(cyl)
+
+if m5_core_pilot_holes:
+    structural_core = structural_core.cut(Part.makeCompound(m5_core_pilot_holes))
+    App.Console.PrintMessage("Successfully cut M5 pilot holes into Core underside.\n")
+
+gk_channel_solid = None
+try:
+    p_start_gk = App.Vector(40.0, 0.0, 15.0)
+    pts_gk = [
+        p_start_gk,
+        App.Vector(40.0, controls_y * 0.05, 5.0),    
+        App.Vector(40.0, controls_y * 0.12, -10.0),  
+        App.Vector(38.0, controls_y * 0.22, -22.0),  
+        App.Vector(30.0, controls_y * 0.45, -22.0),  
+        App.Vector(15.0, controls_y * 0.75, -22.0),  
+        App.Vector(0.0, controls_y, -22.0)           
+    ]
+    
+    curve_gk = Part.BSplineCurve()
+    curve_gk.interpolate(pts_gk)
+    path_wire_gk = Part.Wire([curve_gk.toShape()])
+    
+    initial_dir = (pts_gk[1] - pts_gk[0]).normalize()
+    circle_gk = Part.makeCircle(5.0, p_start_gk, initial_dir)  
+    circle_face_gk = Part.Face(Part.Wire([circle_gk]))
+    
+    gk_channel_solid = path_wire_gk.makePipe(circle_face_gk)
+    structural_core = structural_core.cut(gk_channel_solid)
+except Exception as gk_core_err:
+    App.Console.PrintWarning(f"Core wire tubing cut failed: {str(gk_core_err)}\n")
+
+core_feature = doc.addObject("Part::Feature", "StructuralCore")
+core_feature.Shape = structural_core
+core_feature.ViewObject.ShapeColor = (0.75, 0.60, 0.40)
+
+
+# ==========================================
+# --- 4. IMPORT, ALIGN & BUILD BODY WINGS --
+# ==========================================
+
+existing_pre_body = set(doc.Objects)
+body_solid_shape = None
+
+try:
+    importSVG.insert(FILES["body_contour"], doc.Name)
+    doc.recompute()
+    body_svg_objects = [obj for doc_obj in [doc] for obj in doc_obj.Objects if obj not in existing_pre_body]
+
+    midline_obj, bridge_align_obj = None, None
+    for obj in body_svg_objects:
+        name_l = obj.Name.lower()
+        if 'midline' in name_l: midline_obj = obj
+        elif 'bridge' in name_l: bridge_align_obj = obj
+
+    body_translation = App.Vector(0, 0, 0)
+    if midline_obj and bridge_align_obj:
+        mid_shape = midline_obj.Shape.copy()
+        if hasattr(midline_obj, 'Placement') and midline_obj.Placement: mid_shape.transformShape(midline_obj.Placement.toMatrix())
+        
+        brg_shape = bridge_align_obj.Shape.copy()
+        if hasattr(bridge_align_obj, 'Placement') and bridge_align_obj.Placement: brg_shape.transformShape(bridge_align_obj.Placement.toMatrix())
+
+        midline_y = mid_shape.BoundBox.Center.y
+        bridge_x = brg_shape.BoundBox.Center.x
+        body_translation = App.Vector(-bridge_x, -midline_y, 0)
+
+    body_contour_obj = None
+    max_area = 0.0
+    for obj in body_svg_objects:
+        if 'midline' in obj.Name.lower() or 'bridge' in obj.Name.lower(): continue
+        if hasattr(obj, 'Shape') and not obj.Shape.isNull():
+            bbox = obj.Shape.BoundBox
+            area = (bbox.XMax - bbox.XMin) * (bbox.YMax - bbox.YMin)
+            if area > max_area:
+                max_area = area
+                body_contour_obj = obj
+
+    if body_contour_obj:
+        body_sketch = Draft.make_sketch([body_contour_obj], autoconstraints=True)
+        extrude = doc.addObject("Part::Extrusion", "TempBodyExtrude")
+        extrude.Base = body_sketch
+        extrude.Dir = App.Vector(0, 0, 44.0)
+        extrude.Solid = True
+        doc.recompute()
+
+        body_solid_shape = extrude.Shape.copy()
+        body_solid_shape.translate(body_translation)
+        body_solid_shape.translate(App.Vector(0, 0, -31.0))
+
+    for obj in body_svg_objects:
+        try: doc.removeObject(obj.Name)
+        except Exception: pass
+    if 'body_sketch' in locals() and body_sketch: doc.removeObject(body_sketch.Name)
+    if 'extrude' in locals() and extrude: doc.removeObject(extrude.Name)
+
+except Exception as e:
+    App.Console.PrintError(f"Body Contour Import Error: {str(e)}\n")
+
+
+# ==========================================
+# --- 5. BODY FILLETING & ERGONOMICS -------
+# ==========================================
+
+if body_solid_shape and not body_solid_shape.isNull():
+    try:
+        perimeter_edges = []
+        for edge in body_solid_shape.Edges:
+            bbox = edge.BoundBox
+            is_top = abs(bbox.ZMin - 13.0) < 0.1 and abs(bbox.ZMax - 13.0) < 0.1
+            is_bottom = abs(bbox.ZMin - (-31.0)) < 0.1 and abs(bbox.ZMax - (-31.0)) < 0.1
+            if is_top or is_bottom:
+                perimeter_edges.append(edge)
+
+        if perimeter_edges:
+            for r in [18.0, 16.0, 14.0, 12.0, 8.0, 4.0]:
+                try:
+                    temp_shape = body_solid_shape.makeFillet(r, perimeter_edges)
+                    if temp_shape and temp_shape.isValid() and temp_shape.Volume > 0:
+                        body_solid_shape = temp_shape
+                        break
+                except Exception:
+                    pass
+                finally:
+                    gc.collect()
+    except Exception as e:
+        App.Console.PrintError(f"Perimeter filleting failed: {str(e)}\n")
+
+    try:
+        arm_angle = 10.0  
+        cut_x_start = -310.0 
+        cut_y_start = -40.0 
+        forearm_axis = App.Vector(1.0, 0.15 * side_multiplier, 0.0)
+        arm_rot = App.Rotation(forearm_axis, -arm_angle * side_multiplier)
+        y_box_offset = -250 if is_left_handed else 0
+        cutter_shape = Part.makeBox(500, 250, 100)  
+        placement = App.Placement(App.Vector(cut_x_start, cut_y_start + y_box_offset, 13.0), arm_rot, App.Vector(0, -y_box_offset, 0))
+        cutter_shape.transformShape(placement.toMatrix())
+        body_solid_shape = body_solid_shape.cut(cutter_shape)
+    except Exception as e:
+        App.Console.PrintError(f"Failed to apply forearm cutaway slant: {str(e)}\n")
+
+    try:
+        cone_r1 = 250.0  
+        cone_r2 = 25.0   
+        cone_h = 45.0   
+        belly_shape = Part.makeCone(cone_r1, cone_r2, cone_h)  
+        belly_x = 220.0
+        belly_y = 165.0 * side_multiplier
+        belly_rot = App.Rotation(App.Vector(0, 0, 1), -90)
+        belly_placement = App.Placement(App.Vector(belly_x - cone_h/2, belly_y, -31.0 + cone_h/2 * side_multiplier), belly_rot)
+        belly_shape.transformShape(belly_placement.toMatrix())
+        body_solid_shape = body_solid_shape.cut(belly_shape)
+    except Exception as e:
+        App.Console.PrintError(f"Failed to apply ergonomic belly scoop: {str(e)}\n")
+
+    try:
+        cutaway_edges = []
+        for edge in body_solid_shape.Edges:
+            bbox = edge.BoundBox
+            is_belly_edge = bbox.XMin > 100.0 and (bbox.Center.y * side_multiplier) > 100.0 and bbox.ZMax < 5.0
+            is_forearm_edge = bbox.XMax < 100.0 and bbox.Center.z > 0.0 and abs(bbox.Center.y - (-40.0 * side_multiplier)) > 50.0
+            if is_belly_edge or is_forearm_edge:
+                cutaway_edges.append(edge)
+
+        if cutaway_edges:
+            for radius in [10.0, 8.0, 6.0, 4.0, 2.0]:
+                try:
+                    temp_shape = body_solid_shape.makeFillet(radius, cutaway_edges)
+                    if temp_shape and temp_shape.isValid() and temp_shape.Volume > 0:
+                        body_solid_shape = temp_shape
+                        break
+                except Exception:
+                    pass
+                finally:
+                    gc.collect()
+    except Exception as e:
+        App.Console.PrintError(f"Ergonomic cutaway filleting failed: {str(e)}\n")
+
+
+# ==========================================
+# --- 6. SUBTRACTIVE POCKETS & HARDWARE ---
+# ==========================================
+
+if body_solid_shape and not body_solid_shape.isNull():
+    # 1. Carve Main Control Cavities & Pot Pass-Throughs into Body Shell
+    cavity_ops = [
+        ("cavity", 35.0, -32.0, "CavityRoute"),
+        ("cavity_flange", 6.0, -32.0, "CavityFlangeRoute"),
+        ("pot_holes", 50.0, -32.0, "PotHolesRoute")
+    ]
+    
+    for key, depth, z_pos, name in cavity_ops:
+        if key in FILES:
+            tool_shape = create_svg_solid(FILES[key], depth, name, doc)
+            if tool_shape:
+                bbox = tool_shape.BoundBox
+                tool_shape.translate(App.Vector(-((bbox.XMin + bbox.XMax) / 2.0), -((bbox.YMin + bbox.YMax) / 2.0), -bbox.ZMin))
+                tool_shape.translate(App.Vector(0.0, controls_y, z_pos))
+                body_solid_shape = body_solid_shape.cut(tool_shape)
+
+    # 2. Derive 5 Screw Centers Using Radial Intersections Across Flange Ledge
+    m3_coords = []
+    try:
+        flange_ref = create_svg_solid(FILES["cavity_flange"], 6.0, "FlangeRef", doc)
+        cavity_ref = create_svg_solid(FILES["cavity"], 35.0, "CavityRef", doc)
+
+        if flange_ref and cavity_ref:
+            b_f = flange_ref.BoundBox
+            flange_ref.translate(App.Vector(-((b_f.XMin + b_f.XMax) / 2.0), -((b_f.YMin + b_f.YMax) / 2.0), -b_f.ZMin))
+            flange_ref.translate(App.Vector(0.0, controls_y, -32.0))
+
+            b_c = cavity_ref.BoundBox
+            cavity_ref.translate(App.Vector(-((b_c.XMin + b_c.XMax) / 2.0), -((b_c.YMin + b_c.YMax) / 2.0), -b_c.ZMin))
+            cavity_ref.translate(App.Vector(0.0, controls_y, -32.0))
+
+            ledge_ring_solid = flange_ref.cut(cavity_ref)
+
+            angles_deg = [30.0, 102.0, 174.0, 246.0, 318.0]
+            center_pt = App.Vector(0.0, controls_y, -29.0)
+
+            for angle in angles_deg:
+                rad = math.radians(angle)
+                dir_vec = App.Vector(math.cos(rad), math.sin(rad), 0.0)
+                ray_line = Part.makeLine(center_pt, center_pt + (dir_vec * 200.0))
+                
+                intersect = ledge_ring_solid.common(ray_line)
+                if intersect and not intersect.isNull() and intersect.Edges:
+                    e = intersect.Edges[0]
+                    p_mid = e.valueAt((e.FirstParameter + e.LastParameter) / 2.0)
+                    m3_coords.append(App.Vector(p_mid.x, p_mid.y, -31.0))
+
+    except Exception as radial_err:
+        App.Console.PrintWarning(f"Radial flange sampling failed: {str(radial_err)}\n")
+
+    if len(m3_coords) < 5:
+        m3_coords = [
+            App.Vector(-52.0, controls_y + 28.0, -31.0),
+            App.Vector(12.0, controls_y + 34.0, -31.0),
+            App.Vector(54.0, controls_y + 12.0, -31.0),
+            App.Vector(38.0, controls_y - 30.0, -31.0),
+            App.Vector(-42.0, controls_y - 28.0, -31.0)
+        ]
+
+    # 3. Drill M3 Pilot Holes Upward into Body Ledge
+    body_m3_pilot_cutters = [
+        Part.makeCylinder(1.25, 10.0, App.Vector(pt.x, pt.y, -31.0), App.Vector(0, 0, 1))
+        for pt in m3_coords
+    ]
+
+    if body_m3_pilot_cutters and body_solid_shape:
+        body_solid_shape = body_solid_shape.cut(Part.makeCompound(body_m3_pilot_cutters))
+        App.Console.PrintMessage("Successfully cut 5 M3 pilot holes into cavity flange ledge.\n")
+
+    # 4. Generate Control Cavity Cover (5.5mm depth)
+    cover_raw = create_svg_solid(FILES["cavity_flange"], 5.5, "ControlCavityCover", doc)
+    if cover_raw:
+        bbox_cov = cover_raw.BoundBox
+        cx_cov = (bbox_cov.XMin + bbox_cov.XMax) / 2.0
+        cy_cov = (bbox_cov.YMin + bbox_cov.YMax) / 2.0
+        cover_raw.translate(App.Vector(-cx_cov, -cy_cov, -bbox_cov.ZMin))
+        cover_raw.translate(App.Vector(0.0, controls_y, -31.0))
+
+        try:
+            shrunk_cover = cover_raw.makeOffsetShape(-print_clearance, 0.01, fill=True)
+            if shrunk_cover and shrunk_cover.isValid() and shrunk_cover.Volume > 0:
+                cover_raw = shrunk_cover
+        except Exception:
+            pass
+
+        cover_cutters = []
+        for pt in m3_coords:
+            shaft = Part.makeCylinder(1.6, 12.0, App.Vector(pt.x, pt.y, -32.0), App.Vector(0, 0, 1))
+            csink = Part.makeCone(3.0, 1.6, 1.4, App.Vector(pt.x, pt.y, -31.0), App.Vector(0, 0, 1))
+            cover_cutters.extend([shaft, csink])
+
+        cover_solid = cover_raw.cut(Part.makeCompound(cover_cutters))
+
+        cover_feature = doc.addObject("Part::Feature", "ControlCavityCover")
+        cover_feature.Shape = cover_solid
+        cover_feature.ViewObject.ShapeColor = (0.12, 0.12, 0.12)
+        cover_feature.Label = "ControlCavityCover"
+        App.Console.PrintMessage("Successfully generated ControlCavityCover with radial M3 countersinks.\n")
+
+    # Cut body pocket using FULL-SCALE un-cut core blank tool
+    try:
+        pocket_cutter = full_scale_core_blank.copy()
+        if pocket_cutter and not pocket_cutter.isNull():
+            try:
+                tolerance_cutter = pocket_cutter.makeOffsetShape(0.2, 0.01, fill=True)
+                if tolerance_cutter and not tolerance_cutter.isNull() and tolerance_cutter.Volume > 0:
+                    pocket_cutter = tolerance_cutter
+            except Exception:
+                pass
+
+            body_solid_shape = body_solid_shape.cut(pocket_cutter)
+            App.Console.PrintMessage("Successfully carved full-scale core pocket into Body Shell.\n")
+    except Exception as pocket_err:
+        App.Console.PrintError(f"Failed to cut core pocket: {str(pocket_err)}\n")
+
+    # M5 Screw Pass-Through Holes & Back Surface Countersinks in Body
+    try:
+        m5_body_screw_cutters = []
+        for mx in m5_screw_x_coords:
+            for my in m5_screw_y_coords:
+                pass_shaft = Part.makeCylinder(2.75, 40.0, App.Vector(mx, my * side_multiplier, -32.0), App.Vector(0, 0, 1))
+                csink_cone = Part.makeCone(5.0, 2.75, 4.5, App.Vector(mx, my * side_multiplier, -31.0), App.Vector(0, 0, 1))
+                m5_body_screw_cutters.extend([pass_shaft, csink_cone])
+
+        if m5_body_screw_cutters:
+            body_solid_shape = body_solid_shape.cut(Part.makeCompound(m5_body_screw_cutters))
+            App.Console.PrintMessage("Successfully cut M5 screw holes and 90-degree back countersinks into Body.\n")
+    except Exception as screw_err:
+        App.Console.PrintWarning(f"M5 body screw processing failed: {str(screw_err)}\n")
+
+    try:
+        insert_radius = 3.4 
+        butt_x = -93.0  
+        try:
+            test_line = Part.makeLine(App.Vector(-500.0, -45.0, -9.0), App.Vector(0.0, -45.0, -9.0))
+            intersect = body_solid_shape.common(test_line)
+            if intersect and not intersect.isNull() and intersect.Vertexes:
+                butt_x = min(v.Point.x for v in intersect.Vertexes)
+        except Exception: pass
+        
+        butt_insert_hole = Part.makeCylinder(insert_radius, 26.0, App.Vector(butt_x - 1.0, -45.0, -9.0), App.Vector(1, 0, 0))
+        
+        horn_x, horn_y = 458.0, 115.0 * side_multiplier  
+        horn_pts = [v.Point for v in body_solid_shape.Vertexes if v.Point.x > 400.0]
+        if horn_pts:
+            horn_pts.sort(key=lambda p: p.x, reverse=True)
+            horn_x, horn_y = horn_pts[0].x, horn_pts[0].y
+            
+        horn_insert_hole = Part.makeCylinder(insert_radius, 26.0, App.Vector(horn_x + 1.0, horn_y, -9.0), App.Vector(-1, 0, 0))
+        body_solid_shape = body_solid_shape.cut(Part.makeCompound([butt_insert_hole, horn_insert_hole]))
+    except Exception as strap_err:
+        App.Console.PrintWarning(f"Strap button hole processing failed: {str(strap_err)}\n")
+
+    if gk_channel_solid and not gk_channel_solid.isNull():
+        try:
+            body_solid_shape = body_solid_shape.cut(gk_channel_solid)
+        except Exception as gk_body_err:
+            App.Console.PrintWarning(f"Body wire tubing cut failed: {str(gk_body_err)}\n")
+
+    body_feature = doc.addObject("Part::Feature", "FinalBodyShell")
+    body_feature.Shape = body_solid_shape
+    body_feature.ViewObject.ShapeColor = (0.78, 0.45, 0.35)
+
+# --- FINGER RAMP GENERATION ---
+try:
+    ramp_wire = create_ramp_wire(75.0, 0.0, 110.0, 6.0, 11.0, 500.0)
+    ramp_face = Part.Face(ramp_wire)
+    ramp_solid = ramp_face.extrude(App.Vector(80.0, 0, 0))
+    ramp_feature = doc.addObject("Part::Feature", "FingerRamp")
+    ramp_feature.Shape = ramp_solid
+    ramp_feature.ViewObject.ShapeColor = (0.15, 0.15, 0.15)
+    ramp_feature.Label = "FingerRamp"
+    App.Console.PrintMessage("Successfully generated FingerRamp.\n")
+except Exception as ramp_err:
+    App.Console.PrintError(f"Failed to generate finger ramp: {str(ramp_err)}\n")
+
+
+# ==========================================
+# --- 7. DESIGN SYNCHRONIZED FRETBOARD -----
+# ==========================================
+
+try:
+    heel_y_coords = [v.Point.y for v in full_scale_core_blank.Vertexes if abs(v.Point.x - neck_stop_x) < 2.0]
+    nut_y_coords = [v.Point.y for v in full_scale_core_blank.Vertexes if abs(v.Point.x - span_end_x) < 2.0]
+    
+    width_heel_core = (max(heel_y_coords) - min(heel_y_coords)) if heel_y_coords else 90.0
+    width_nut_core = (max(nut_y_coords) - min(nut_y_coords)) if nut_y_coords else width_headstock_nut
+    
+    def get_core_neck_width(x):
+        return width_heel_core + (width_nut_core - width_heel_core) * ((x - neck_stop_x) / (span_end_x - neck_stop_x))
+
+    x_neck_mid = span_end_x - 25.0
+    wire_fb_heel = create_fretboard_radiused_wire(neck_stop_x, center_y, width_heel_core)
+    wire_fb_mid = create_fretboard_radiused_wire(x_neck_mid, center_y, get_core_neck_width(x_neck_mid))
+    wire_fb_nut = create_fretboard_radiused_wire(span_end_x, center_y, width_nut_core)
+    
+    fretboard_main = Part.makeLoft([wire_fb_heel, wire_fb_mid], True)
+    fretboard_trans = Part.makeLoft([wire_fb_mid, wire_fb_nut], True)
+    fretboard_solid = fretboard_main.fuse(fretboard_trans)
+    
+    target_marker_frets = [3, 5, 7, 9, 12, 15, 17, 19, 21, 24]
+    marker_cutters = []
+    marker_chips = []
+    side_marker_cutters = []
+    side_marker_chips = []
+    fret_slots = []
+    
+    sm_length = 2.0
+    sm_height = 1.5
+    sm_depth = 1.5
+    
+    for n in range(1, 25): 
+        fret_x = scale_length * (2.0 ** (-n / 12.0))
+        w_fret = get_core_neck_width(fret_x)
+        slot_box = create_curved_slot_cutter(fret_x, center_y, w_fret)
+        fret_slots.append(slot_box)
+        
+        if n in target_marker_frets:
+            prev_fret_x = scale_length * (2.0 ** (-(n - 1) / 12.0))
+            marker_x = (fret_x + prev_fret_x) / 2.0
+            fret_spacing = prev_fret_x - fret_x
+            marker_length = min(6.0, fret_spacing * 0.35)
+            
+            w_marker = get_core_neck_width(marker_x)
+            marker_width = w_marker * 0.4
+            
+            # Shrunk dimensions for Fret Marker Chips (0.25mm offset per side = 0.5mm overall fit)
+            chip_length = max(0.5, marker_length - (2.0 * print_clearance))
+            chip_width = max(0.5, marker_width - (2.0 * print_clearance))
+
+            if n in [12, 24]:
+                offset_y = marker_width * 0.25
+                sub_width = marker_width * 0.35
+                chip_sub_width = max(0.5, sub_width - (2.0 * print_clearance))
+
+                # Pocket Cutters (Full scale)
+                box_l = Part.makeBox(marker_length, sub_width, 2.0, App.Vector(marker_x - marker_length / 2.0, center_y - offset_y - sub_width / 2.0, 22.5))
+                box_r = Part.makeBox(marker_length, sub_width, 2.0, App.Vector(marker_x - marker_length / 2.0, center_y + offset_y - sub_width / 2.0, 22.5))
+                marker_cutters.extend([box_l, box_r])
+
+                # Marker Chips (Clearance applied)
+                chip_l = Part.makeBox(chip_length, chip_sub_width, 2.0, App.Vector(marker_x - chip_length / 2.0, center_y - offset_y - chip_sub_width / 2.0, 22.5))
+                chip_r = Part.makeBox(chip_length, chip_sub_width, 2.0, App.Vector(marker_x - chip_length / 2.0, center_y + offset_y - chip_sub_width / 2.0, 22.5))
+                marker_chips.extend([chip_l, chip_r])
+            else:
+                box_marker = Part.makeBox(marker_length, marker_width, 2.0, App.Vector(marker_x - marker_length / 2.0, center_y - marker_width / 2.0, 22.5))
+                marker_cutters.append(box_marker)
+
+                chip_marker = Part.makeBox(chip_length, chip_width, 2.0, App.Vector(marker_x - chip_length / 2.0, center_y - chip_width / 2.0, 22.5))
+                marker_chips.append(chip_marker)
+            
+            ry_marker = w_marker / 2.0
+            z_edge = (24.0 - 500.0) + math.sqrt(500.0**2 - ry_marker**2)
+            z_mid_face = 17.0 + (z_edge - 17.0) / 2.0
+            z_start_sm = z_mid_face - sm_height / 2.0
+            edge_y = center_y + side_multiplier * ry_marker
+            y_start = edge_y - 0.1 if side_multiplier == -1 else edge_y - sm_depth
+            
+            # Shrunk Side Dot Chip Dimensions
+            sm_chip_len = max(0.5, sm_length - (2.0 * print_clearance))
+            sm_chip_h = max(0.5, sm_height - (2.0 * print_clearance))
+
+            if n in [12, 24]:
+                spacing = 2.0
+                sm_box_l = Part.makeBox(sm_length, sm_depth + 0.1, sm_height, App.Vector(marker_x - spacing - sm_length / 2.0, y_start, z_start_sm))
+                sm_box_r = Part.makeBox(sm_length, sm_depth + 0.1, sm_height, App.Vector(marker_x + spacing - sm_length / 2.0, y_start, z_start_sm))
+                side_marker_cutters.extend([sm_box_l, sm_box_r])
+
+                sm_chip_l = Part.makeBox(sm_chip_len, sm_depth, sm_chip_h, App.Vector(marker_x - spacing - sm_chip_len / 2.0, y_start, z_start_sm + print_clearance))
+                sm_chip_r = Part.makeBox(sm_chip_len, sm_depth, sm_chip_h, App.Vector(marker_x + spacing - sm_chip_len / 2.0, y_start, z_start_sm + print_clearance))
+                side_marker_chips.extend([sm_chip_l, sm_chip_r])
+            else:
+                sm_box = Part.makeBox(sm_length, sm_depth + 0.1, sm_height, App.Vector(marker_x - sm_length / 2.0, y_start, z_start_sm))
+                side_marker_cutters.append(sm_box)
+
+                sm_chip = Part.makeBox(sm_chip_len, sm_depth, sm_chip_h, App.Vector(marker_x - sm_chip_len / 2.0, y_start, z_start_sm + print_clearance))
+                side_marker_chips.append(sm_chip)
+
+    # Standalone Fretboard Marker Chips (Shrunk for 0.5mm clearance fit)
+    if marker_chips:
+        chips_feature = doc.addObject("Part::Feature", "FretMarkers")
+        chips_feature.Shape = Part.makeCompound(marker_chips)
+        chips_feature.ViewObject.ShapeColor = (0.95, 0.95, 0.90)  # Off-white/pearl
+        chips_feature.Label = "FretMarkers"
+
+    if side_marker_chips:
+        side_chips_feature = doc.addObject("Part::Feature", "SideFretMarkers")
+        side_chips_feature.Shape = Part.makeCompound(side_marker_chips)
+        side_chips_feature.ViewObject.ShapeColor = (1.0, 1.0, 1.0)
+        side_chips_feature.Label = "SideFretMarkers"
+
+    # Cut full-scale inlay pockets into Fretboard
+    if marker_cutters:
+        fretboard_solid = fretboard_solid.cut(Part.makeCompound(marker_cutters))
+    if side_marker_cutters:
+        fretboard_solid = fretboard_solid.cut(Part.makeCompound(side_marker_cutters))
+    if fret_slots:
+        fretboard_solid = fretboard_solid.cut(Part.makeCompound(fret_slots))
+        
+    fretboard_feature = doc.addObject("Part::Feature", "FinalFretboard")
+    fretboard_feature.Shape = fretboard_solid
+    fretboard_feature.ViewObject.ShapeColor = (0.12, 0.12, 0.12)  
+    fretboard_feature.Label = "FinalFretboard"
+
+except Exception as e:
+    App.Console.PrintError(f"Failed to generate synchronized fretboard: {str(e)}\n")
+
+doc.recompute()
+gc.collect()
