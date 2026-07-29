@@ -23,7 +23,7 @@ is_left_handed = True
 side_multiplier = -1 if is_left_handed else 1
 
 # Carbon Fiber wrap allowance (in mm)
-cf_wrap_thickness = 1.2  # Set to 0.0 for un-shrunk core
+cf_wrap_thickness = 1.2  # Set to 0.0 for un-shrunk core with truss rod/CF rods
 
 # 3D Printing Fit Clearance Offset (0.25mm per side = 0.5mm overall clearance)
 print_clearance = 0.25 
@@ -49,6 +49,15 @@ controls_y = -100.0 * side_multiplier
 # M5 Body-to-Core Attachment Screw Landmarks (X = 165mm clears belly scoop)
 m5_screw_x_coords = [10.0, 165.0]
 m5_screw_y_coords = [-25.0, 25.0]
+
+# --- 0.1 RELIEF CALCULATOR FOR FRETBOARD FORWARD BOW ---
+def get_fretboard_relief_dip(x):
+    """Calculates 0.3mm parabolic forward-bow relief dip along playing length if CF wrap is enabled."""
+    if cf_wrap_thickness > 0.0:
+        t = (x - neck_stop_x) / (span_end_x - neck_stop_x)
+        t = max(0.0, min(1.0, t))
+        return 0.30 * 4.0 * t * (1.0 - t)
+    return 0.0
 
 # ==========================================
 # --- 1. GEOMETRY HELPER FUNCTIONS ---------
@@ -159,9 +168,12 @@ def create_asymmetric_rectangle_wire(x, y_min, y_max, thickness, z_top=17.0):
 
 
 def create_fretboard_radiused_wire(x, y_center, width, thickness=7.0, z_bottom=17.0, radius=500.0):
-    """Creates a crowned profile wire for the fretboard using a 500mm radius."""
+    """Creates a crowned profile wire for the fretboard taking local parabolic relief into account."""
+    dip = get_fretboard_relief_dip(x)
+    actual_thickness = thickness - dip
+    
     ry = width / 2.0
-    z_peak = z_bottom + thickness
+    z_peak = z_bottom + actual_thickness
     z_center_circle = z_peak - radius
     
     z_edge = z_center_circle + math.sqrt(radius**2 - ry**2)
@@ -185,9 +197,12 @@ def create_fretboard_radiused_wire(x, y_center, width, thickness=7.0, z_bottom=1
 
 
 def create_curved_slot_cutter(x, y_center, width, slot_width=0.6, slot_depth=1.5, radius=500.0):
-    """Generates a concentric curved cylinder solid to cut slots with uniform luthier-depth."""
+    """Generates a concentric curved cylinder solid aligned with local fretboard relief height."""
+    dip = get_fretboard_relief_dip(x)
+    z_peak_fret = (17.0 + 7.0) - dip  # Local peak surface height
+    
     ry = (width + 10.0) / 2.0
-    z_center_circle = 24.0 - radius
+    z_center_circle = z_peak_fret - radius
     
     r_top = radius + 1.0  
     r_bot = radius - slot_depth  
@@ -517,44 +532,48 @@ hole_shapes = [
 ]
 structural_core = structural_core.cut(Part.makeCompound(hole_shapes))
 
-# --- CARBON FIBER REINFORCEMENT ROD CHANNELS (Y-OFFSET REDUCED TO 15mm) ---
-# Twin 6.35mm x 10.02mm slots positioned closer to the centerline
-cf_rod_length = 625.0  # X = 215.0mm to X = 840.0mm
-cf_rod_width = 6.35
-cf_rod_depth = 9.52 + 0.50  # 10.02mm depth accounts for epoxy glue line
-cf_y_offset = 15.0  # Tightened from 18.0mm to prevent cutting through neck carve
+# --- CONDITIONAL REINFORCEMENT & TRUSS ROD CUTTING ---
+if cf_wrap_thickness == 0.0:
+    # Carbon Fiber Rod Channels (Only cut when core is un-shrunk / un-wrapped)
+    cf_rod_length = 625.0  
+    cf_rod_width = 6.35
+    cf_rod_depth = 9.52 + 0.50  # 10.02mm depth
+    cf_y_offset = 15.0  
 
-cf_channel_left = Part.makeBox(
-    cf_rod_length, cf_rod_width, cf_rod_depth,
-    App.Vector(215.0, center_y - cf_y_offset - (cf_rod_width / 2.0), z_neck_top - cf_rod_depth)
-)
+    cf_channel_left = Part.makeBox(
+        cf_rod_length, cf_rod_width, cf_rod_depth,
+        App.Vector(215.0, center_y - cf_y_offset - (cf_rod_width / 2.0), z_neck_top - cf_rod_depth)
+    )
 
-cf_channel_right = Part.makeBox(
-    cf_rod_length, cf_rod_width, cf_rod_depth,
-    App.Vector(215.0, center_y + cf_y_offset - (cf_rod_width / 2.0), z_neck_top - cf_rod_depth)
-)
+    cf_channel_right = Part.makeBox(
+        cf_rod_length, cf_rod_width, cf_rod_depth,
+        App.Vector(215.0, center_y + cf_y_offset - (cf_rod_width / 2.0), z_neck_top - cf_rod_depth)
+    )
 
-structural_core = structural_core.cut(Part.makeCompound([cf_channel_left, cf_channel_right]))
-App.Console.PrintMessage("Successfully cut Carbon Fiber channels (15mm Y-offset, 10.02mm depth) into Core.\n")
+    # Truss Rod Channel and Pocket Cutters
+    truss_rod_cutter = Part.makeBox(
+        610.0, 6.35, 11.52, 
+        App.Vector(neck_stop_x, center_y - 6.35 / 2.0, z_neck_top - 9.52)
+    )
 
-# Truss Rod Channel and Pocket Cutters
-truss_rod_cutter = Part.makeBox(
-    610.0, 6.35, 11.52, 
-    App.Vector(neck_stop_x, center_y - 6.35 / 2.0, z_neck_top - 9.52)
-)
+    truss_rod_nut_pocket = Part.makeBox(
+        35.5, 10.0, 10.0,
+        App.Vector(neck_stop_x, center_y - 10.0 / 2.0, z_neck_top - 10.0)
+    )
 
-truss_rod_nut_pocket = Part.makeBox(
-    35.5, 10.0, 10.0,
-    App.Vector(neck_stop_x, center_y - 10.0 / 2.0, z_neck_top - 10.0)
-)
+    access_cutter = Part.makeBox(
+        30.0, 10.0, 14.0, 
+        App.Vector(neck_stop_x - 30.0, center_y - 10.0 / 2.0, z_neck_top - 12.0)
+    )
 
-access_cutter = Part.makeBox(
-    30.0, 10.0, 14.0, 
-    App.Vector(neck_stop_x - 30.0, center_y - 10.0 / 2.0, z_neck_top - 12.0)
-)
-
-truss_cutters_compound = Part.makeCompound([truss_rod_cutter, truss_rod_nut_pocket, access_cutter])
-structural_core = structural_core.cut(truss_cutters_compound)
+    neck_reinforcement_cutters = Part.makeCompound([
+        cf_channel_left, cf_channel_right,
+        truss_rod_cutter, truss_rod_nut_pocket, access_cutter
+    ])
+    structural_core = structural_core.cut(neck_reinforcement_cutters)
+    App.Console.PrintMessage("Cut Truss Rod and Carbon Fiber channels into un-wrapped Core.\n")
+else:
+    App.Console.PrintMessage("Skipped Truss Rod and CF channels (CF Wrap enabled: core rigid enough).\n")
 
 # M5 Threaded Insert Pilot Holes in Core (Bottom Surface, 4.2mm Diameter x 12.0mm Depth)
 m5_core_pilot_holes = []
@@ -937,15 +956,20 @@ try:
     def get_core_neck_width(x):
         return width_heel_core + (width_nut_core - width_heel_core) * ((x - neck_stop_x) / (span_end_x - neck_stop_x))
 
-    x_neck_mid = span_end_x - 25.0
-    wire_fb_heel = create_fretboard_radiused_wire(neck_stop_x, center_y, width_heel_core)
-    wire_fb_mid = create_fretboard_radiused_wire(x_neck_mid, center_y, get_core_neck_width(x_neck_mid))
-    wire_fb_nut = create_fretboard_radiused_wire(span_end_x, center_y, width_nut_core)
+    # Construct multi-section loft to generate smooth parabolic relief across top surface
+    num_sections = 12
+    fb_section_wires = []
+    for i in range(num_sections + 1):
+        x_curr = neck_stop_x + (i / float(num_sections)) * (span_end_x - neck_stop_x)
+        w_curr = get_core_neck_width(x_curr)
+        wire_curr = create_fretboard_radiused_wire(x_curr, center_y, w_curr)
+        fb_section_wires.append(wire_curr)
+
+    fretboard_solid = Part.makeLoft(fb_section_wires, True)
     
-    fretboard_main = Part.makeLoft([wire_fb_heel, wire_fb_mid], True)
-    fretboard_trans = Part.makeLoft([wire_fb_mid, wire_fb_nut], True)
-    fretboard_solid = fretboard_main.fuse(fretboard_trans)
-    
+    if cf_wrap_thickness > 0.0:
+        App.Console.PrintMessage("Generated Fretboard with 0.3mm artificial parabolic forward-bow relief.\n")
+
     target_marker_frets = [3, 5, 7, 9, 12, 15, 17, 19, 21, 24]
     marker_cutters = []
     marker_chips = []
@@ -972,6 +996,10 @@ try:
             w_marker = get_core_neck_width(marker_x)
             marker_width = w_marker * 0.4
             
+            # Local Z positioning with relief dip adjustment
+            dip_m = get_fretboard_relief_dip(marker_x)
+            z_pocket_start = 22.5 - dip_m
+
             # Shrunk dimensions for Fret Marker Chips (0.25mm offset per side = 0.5mm overall fit)
             chip_length = max(0.5, marker_length - (2.0 * print_clearance))
             chip_width = max(0.5, marker_width - (2.0 * print_clearance))
@@ -982,23 +1010,24 @@ try:
                 chip_sub_width = max(0.5, sub_width - (2.0 * print_clearance))
 
                 # Pocket Cutters (Full scale)
-                box_l = Part.makeBox(marker_length, sub_width, 2.0, App.Vector(marker_x - marker_length / 2.0, center_y - offset_y - sub_width / 2.0, 22.5))
-                box_r = Part.makeBox(marker_length, sub_width, 2.0, App.Vector(marker_x - marker_length / 2.0, center_y + offset_y - sub_width / 2.0, 22.5))
+                box_l = Part.makeBox(marker_length, sub_width, 2.0, App.Vector(marker_x - marker_length / 2.0, center_y - offset_y - sub_width / 2.0, z_pocket_start))
+                box_r = Part.makeBox(marker_length, sub_width, 2.0, App.Vector(marker_x - marker_length / 2.0, center_y + offset_y - sub_width / 2.0, z_pocket_start))
                 marker_cutters.extend([box_l, box_r])
 
                 # Marker Chips (Clearance applied)
-                chip_l = Part.makeBox(chip_length, chip_sub_width, 2.0, App.Vector(marker_x - chip_length / 2.0, center_y - offset_y - chip_sub_width / 2.0, 22.5))
-                chip_r = Part.makeBox(chip_length, chip_sub_width, 2.0, App.Vector(marker_x - chip_length / 2.0, center_y + offset_y - chip_sub_width / 2.0, 22.5))
+                chip_l = Part.makeBox(chip_length, chip_sub_width, 2.0, App.Vector(marker_x - chip_length / 2.0, center_y - offset_y - chip_sub_width / 2.0, z_pocket_start))
+                chip_r = Part.makeBox(chip_length, chip_sub_width, 2.0, App.Vector(marker_x - chip_length / 2.0, center_y + offset_y - chip_sub_width / 2.0, z_pocket_start))
                 marker_chips.extend([chip_l, chip_r])
             else:
-                box_marker = Part.makeBox(marker_length, marker_width, 2.0, App.Vector(marker_x - marker_length / 2.0, center_y - marker_width / 2.0, 22.5))
+                box_marker = Part.makeBox(marker_length, marker_width, 2.0, App.Vector(marker_x - marker_length / 2.0, center_y - marker_width / 2.0, z_pocket_start))
                 marker_cutters.append(box_marker)
 
-                chip_marker = Part.makeBox(chip_length, chip_width, 2.0, App.Vector(marker_x - chip_length / 2.0, center_y - chip_width / 2.0, 22.5))
+                chip_marker = Part.makeBox(chip_length, chip_width, 2.0, App.Vector(marker_x - chip_length / 2.0, center_y - chip_width / 2.0, z_pocket_start))
                 marker_chips.append(chip_marker)
             
             ry_marker = w_marker / 2.0
-            z_edge = (24.0 - 500.0) + math.sqrt(500.0**2 - ry_marker**2)
+            z_peak_marker = (17.0 + 7.0) - dip_m
+            z_edge = (z_peak_marker - 500.0) + math.sqrt(500.0**2 - ry_marker**2)
             z_mid_face = 17.0 + (z_edge - 17.0) / 2.0
             z_start_sm = z_mid_face - sm_height / 2.0
             edge_y = center_y + side_multiplier * ry_marker
