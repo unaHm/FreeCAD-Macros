@@ -23,7 +23,7 @@ is_left_handed = True
 side_multiplier = -1 if is_left_handed else 1
 
 # Carbon Fiber wrap allowance (in mm)
-cf_wrap_thickness = 1.2  # Set to 0.0 for un-shrunk core with truss rod/CF rods
+cf_wrap_thickness = 1.2  # Set to 0.0 for un-shrunk single-piece core with truss/CF rods
 
 # 3D Printing Fit Clearance Offset (0.25mm per side = 0.5mm overall clearance)
 print_clearance = 0.25 
@@ -458,7 +458,9 @@ except Exception as seam_err:
 if tuner_cutters:
     full_scale_core_blank = full_scale_core_blank.cut(Part.makeCompound(tuner_cutters))
 
-# --- 3.3 CONSTRUCT TAPERED SHRUNK CORE FOR STRUCTURAL CORE OUTPUT ---
+# --- 3.3 CONSTRUCT SHRUNK CORE & ISOLATE LOCALIZED BRIDGE INSERT BLOCK ---
+bridge_insert_solid = None
+
 if cf_wrap_thickness > 0.0:
     w_heel_s = width_heel - (2.0 * cf_wrap_thickness)
     t_heel_s = thickness_heel - (2.0 * cf_wrap_thickness)
@@ -499,6 +501,25 @@ if cf_wrap_thickness > 0.0:
 
     bridge_s_solid = bridge_s_solid.cut(Part.makeCompound([cutter_top_s, cutter_bot_s]))
 
+    # Fillet bottom edges of shrunk bridge block to match body pocket radii
+    s_bridge_relief_edges = []
+    for edge in bridge_s_solid.Edges:
+        bbox = edge.BoundBox
+        is_bottom_edge = abs(bbox.ZMin - z_bridge_bot_s) < 0.1 and abs(bbox.ZMax - z_bridge_bot_s) < 0.1
+        is_vertical_corner = abs(bbox.ZMax - bbox.ZMin) > (h_bridge_s - 1.0) and (bbox.XMin < (bridge_start_x + 2.0) or abs(bbox.XMax - neck_stop_x) < 2.0)
+        if is_bottom_edge or is_vertical_corner:
+            s_bridge_relief_edges.append(edge)
+
+    if s_bridge_relief_edges:
+        for r_s in [3.0, 2.0, 1.0]:
+            try:
+                temp_b = bridge_s_solid.makeFillet(r_s, s_bridge_relief_edges)
+                if temp_b and temp_b.isValid() and temp_b.Volume > 0:
+                    bridge_s_solid = temp_b
+                    break
+            except Exception:
+                pass
+
     hs_body_s = headstock_svg_face.extrude(App.Vector(0, 0, 17.0))
     if outer_wire:
         try:
@@ -513,14 +534,23 @@ if cf_wrap_thickness > 0.0:
     wire_hs_s = create_asymmetric_rectangle_wire(x_volute_end, y_min_hs + cf_wrap_thickness, y_max_hs - cf_wrap_thickness, 17.0 - cf_wrap_thickness, z_top=z_top_s)
     volute_s = Part.makeLoft([wire_nut_s, wire_hs_s], True)
 
-    shrunk_core_blank = bridge_s_solid.fuse(neck_s_solid).fuse(volute_s).fuse(hs_body_s)
+    shrunk_full_core = bridge_s_solid.fuse(neck_s_solid).fuse(volute_s).fuse(hs_body_s)
     if tuner_cutters:
-        shrunk_core_blank = shrunk_core_blank.cut(Part.makeCompound(tuner_cutters))
-    structural_core = shrunk_core_blank
+        shrunk_full_core = shrunk_full_core.cut(Part.makeCompound(tuner_cutters))
+
+    # Split shrunk core at X = 30mm (between X = 15mm bridge screw holes and X = 40mm pickup wire tube)
+    x_split_boundary = 30.0
+    cutter_insert_zone = Part.makeBox(
+        x_split_boundary - bridge_start_x, 200.0, 100.0,
+        App.Vector(bridge_start_x, -100.0, -50.0)
+    )
+
+    bridge_insert_solid = shrunk_full_core.common(cutter_insert_zone)
+    structural_core = shrunk_full_core.cut(cutter_insert_zone)
 else:
     structural_core = full_scale_core_blank.copy()
 
-# --- 3.4 APPLY SUBTRACTIVE FEATURES TO CORE ---
+# --- 3.4 APPLY SUBTRACTIVE FEATURES TO CORE AND ISOLATED BRIDGE INSERT BLOCK ---
 node_radius = 2.1
 hole_depth = 25.0   
 x_positions = [-15.0, 15.0]  
@@ -530,7 +560,35 @@ hole_shapes = [
     Part.makeCylinder(node_radius, hole_depth, App.Vector(x, y, z_step_interface), App.Vector(0, 0, -1))
     for x in x_positions for y in y_positions
 ]
-structural_core = structural_core.cut(Part.makeCompound(hole_shapes))
+
+# M5 Threaded Insert Pilot Holes (X = 10mm falls in BridgeInsertBlock, X = 165mm falls in StructuralCore)
+m5_screw_10_cutters = []
+m5_screw_165_cutters = []
+
+for mx in m5_screw_x_coords:
+    for my in m5_screw_y_coords:
+        cyl = Part.makeCylinder(2.1, 12.0, App.Vector(mx, my * side_multiplier, z_bridge_bottom), App.Vector(0, 0, 1))
+        if mx < 30.0:
+            m5_screw_10_cutters.append(cyl)
+        else:
+            m5_screw_165_cutters.append(cyl)
+
+if bridge_insert_solid:
+    # 1. Drill 12-node hole array and X = 10mm M5 inserts into BridgeInsertBlock
+    bridge_insert_solid = bridge_insert_solid.cut(Part.makeCompound(hole_shapes))
+    if m5_screw_10_cutters:
+        bridge_insert_solid = bridge_insert_solid.cut(Part.makeCompound(m5_screw_10_cutters))
+    App.Console.PrintMessage("Applied 12-hole node array and forward M5 inserts to isolated BridgeInsertBlock.\n")
+
+    # 2. Drill X = 165mm M5 inserts into main StructuralCore
+    if m5_screw_165_cutters:
+        structural_core = structural_core.cut(Part.makeCompound(m5_screw_165_cutters))
+else:
+    # Single-piece core handling
+    structural_core = structural_core.cut(Part.makeCompound(hole_shapes))
+    all_m5_cutters = m5_screw_10_cutters + m5_screw_165_cutters
+    if all_m5_cutters:
+        structural_core = structural_core.cut(Part.makeCompound(all_m5_cutters))
 
 # --- CONDITIONAL REINFORCEMENT & TRUSS ROD CUTTING ---
 if cf_wrap_thickness == 0.0:
@@ -575,17 +633,6 @@ if cf_wrap_thickness == 0.0:
 else:
     App.Console.PrintMessage("Skipped Truss Rod and CF channels (CF Wrap enabled: core rigid enough).\n")
 
-# M5 Threaded Insert Pilot Holes in Core (Bottom Surface, 4.2mm Diameter x 12.0mm Depth)
-m5_core_pilot_holes = []
-for mx in m5_screw_x_coords:
-    for my in m5_screw_y_coords:
-        cyl = Part.makeCylinder(2.1, 12.0, App.Vector(mx, my * side_multiplier, z_bridge_bottom), App.Vector(0, 0, 1))
-        m5_core_pilot_holes.append(cyl)
-
-if m5_core_pilot_holes:
-    structural_core = structural_core.cut(Part.makeCompound(m5_core_pilot_holes))
-    App.Console.PrintMessage("Successfully cut M5 pilot holes into Core underside.\n")
-
 gk_channel_solid = None
 try:
     p_start_gk = App.Vector(40.0, 0.0, 15.0)
@@ -615,6 +662,13 @@ except Exception as gk_core_err:
 core_feature = doc.addObject("Part::Feature", "StructuralCore")
 core_feature.Shape = structural_core
 core_feature.ViewObject.ShapeColor = (0.75, 0.60, 0.40)
+
+if bridge_insert_solid:
+    bridge_insert_feature = doc.addObject("Part::Feature", "BridgeInsertBlock")
+    bridge_insert_feature.Shape = bridge_insert_solid
+    bridge_insert_feature.ViewObject.ShapeColor = (0.25, 0.25, 0.28)  # Charcoal/PC-CF look
+    bridge_insert_feature.Label = "BridgeInsertBlock"
+    App.Console.PrintMessage("Successfully isolated BridgeInsertBlock (X = -30mm to +30mm) with matched bottom filleting.\n")
 
 
 # ==========================================
@@ -1050,7 +1104,7 @@ try:
                 sm_box = Part.makeBox(sm_length, sm_depth + 0.1, sm_height, App.Vector(marker_x - sm_length / 2.0, y_start, z_start_sm))
                 side_marker_cutters.append(sm_box)
 
-                sm_chip = Part.makeBox(sm_chip_len, sm_depth, sm_chip_h, App.Vector(marker_x - sm_chip_len / 2.0, y_start, z_start_sm + print_clearance))
+                sm_chip = Part.makeBox(sm_chip_len, sm_depth, sm_chip_h, App.Vector(marker_x - sm_length / 2.0, y_start, z_start_sm + print_clearance))
                 side_marker_chips.append(sm_chip)
 
     # Standalone Fretboard Marker Chips (Shrunk for 0.5mm clearance fit)
