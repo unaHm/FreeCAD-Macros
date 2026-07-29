@@ -23,7 +23,7 @@ is_left_handed = True
 side_multiplier = -1 if is_left_handed else 1
 
 # Carbon Fiber wrap allowance (in mm)
-cf_wrap_thickness = 1.2  # Set to 0.0 for un-shrunk single-piece core with truss/CF rods
+cf_wrap_thickness = 0.0  # Set to 0.0 for un-shrunk single-piece core with truss/CF rods & logo
 
 # 3D Printing Fit Clearance Offset (0.25mm per side = 0.5mm overall clearance)
 print_clearance = 0.25 
@@ -33,7 +33,8 @@ FILES = {
     "headstock": "/home/dan/Downloads/swainybass-2026-06-headstock-complete.svg",
     "cavity": "/home/dan/Downloads/swainybass-2026-06-cavity.svg",
     "cavity_flange": "/home/dan/Downloads/swainybass-2026-06-cavityflange.svg",
-    "pot_holes": "/home/dan/Downloads/swainybass-2026-06-through-holes.svg"
+    "pot_holes": "/home/dan/Downloads/swainybass-2026-06-through-holes.svg",
+    "logo": "/home/dan/Downloads/swainybass-logo.svg"
 }
 
 scale_length = 864.0
@@ -633,6 +634,67 @@ if cf_wrap_thickness == 0.0:
 else:
     App.Console.PrintMessage("Skipped Truss Rod and CF channels (CF Wrap enabled: core rigid enough).\n")
 
+# --- HEADSTOCK LOGO ENGRAVING & INLAY (ONLY WHEN cf_wrap_thickness == 0.0) ---
+if cf_wrap_thickness == 0.0 and "logo" in FILES:
+    try:
+        logo_depth = 0.5
+        
+        # 1. Extrude raw SVG geometry for pocket cut (extra thickness for clean cut)
+        logo_raw = create_svg_solid(FILES["logo"], logo_depth + 2.0, "HeadstockLogo", doc)
+        
+        # 2. Extrude exact SVG geometry for inlay solid chip (exact 0.5mm depth)
+        logo_inlay = create_svg_solid(FILES["logo"], logo_depth, "HeadstockLogoInlaySolid", doc)
+
+        if logo_raw and logo_inlay:
+            bbox_logo = logo_raw.BoundBox
+            logo_width_x = bbox_logo.XMax - bbox_logo.XMin
+            
+            # Position 7.5mm from the tip of the headstock
+            hs_tip_x = max(v.Point.x for v in structural_core.Vertexes)
+            target_logo_x = (hs_tip_x - 7.5) - logo_width_x
+            
+            # Sample actual headstock profile boundary Y-limits at target_logo_x
+            sample_line = Part.makeLine(
+                App.Vector(target_logo_x, -200.0, 17.0),
+                App.Vector(target_logo_x, 200.0, 17.0)
+            )
+            hs_intersection = headstock_body.common(sample_line)
+            
+            if hs_intersection and hs_intersection.Vertexes:
+                y_pts = [v.Point.y for v in hs_intersection.Vertexes]
+                hs_y_top = max(y_pts)
+                hs_y_bot = min(y_pts)
+            else:
+                hs_y_top = headstock_top_y
+                hs_y_bot = headstock_bottom_y
+
+            # Calculate Y-offset to make d_top (hs_y_top - logo_ymax) == d_bot (logo_ymin - hs_y_bot)
+            logo_h_y = bbox_logo.YMax - bbox_logo.YMin
+            target_logo_y = (hs_y_top + hs_y_bot) / 2.0 - (logo_h_y / 2.0)
+            
+            y_shift = target_logo_y - bbox_logo.YMin
+            x_shift = target_logo_x - bbox_logo.XMin
+            z_shift = (z_neck_top - logo_depth) - bbox_logo.ZMin
+
+            # Translate Cutter Pocket
+            logo_raw.translate(App.Vector(x_shift, y_shift, z_shift))
+
+            # Cut 0.5mm deep pocket into Headstock
+            structural_core = structural_core.cut(logo_raw)
+            App.Console.PrintMessage("Successfully engraved 0.5mm Logo with equalized perimeter margins.\n")
+
+            # Translate direct SVG Inlay Solid chip to exact same location
+            logo_inlay.translate(App.Vector(x_shift, y_shift, z_shift))
+
+            logo_feature = doc.addObject("Part::Feature", "HeadstockLogoInlay")
+            logo_feature.Shape = logo_inlay
+            logo_feature.ViewObject.ShapeColor = (0.10, 0.10, 0.10)  # Black inlay/resin preview
+            logo_feature.Label = "HeadstockLogoInlay"
+            App.Console.PrintMessage("Successfully generated exact SVG HeadstockLogoInlay solid.\n")
+
+    except Exception as logo_err:
+        App.Console.PrintError(f"Failed to process headstock logo: {str(logo_err)}\n")
+
 gk_channel_solid = None
 try:
     p_start_gk = App.Vector(40.0, 0.0, 15.0)
@@ -1104,7 +1166,7 @@ try:
                 sm_box = Part.makeBox(sm_length, sm_depth + 0.1, sm_height, App.Vector(marker_x - sm_length / 2.0, y_start, z_start_sm))
                 side_marker_cutters.append(sm_box)
 
-                sm_chip = Part.makeBox(sm_chip_len, sm_depth, sm_chip_h, App.Vector(marker_x - sm_length / 2.0, y_start, z_start_sm + print_clearance))
+                sm_chip = Part.makeBox(sm_chip_len, sm_depth, sm_chip_h, App.Vector(marker_x - sm_chip_len / 2.0, y_start, z_start_sm + print_clearance))
                 side_marker_chips.append(sm_chip)
 
     # Standalone Fretboard Marker Chips (Shrunk for 0.5mm clearance fit)
