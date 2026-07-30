@@ -1198,5 +1198,159 @@ try:
 except Exception as e:
     App.Console.PrintError(f"Failed to generate synchronized fretboard: {str(e)}\n")
 
+# ==========================================
+# --- 8. DESIGN SLEEK GRADIENT NUT ---------
+# ==========================================
+
+try:
+    # --- 8.1 CONFIGURATION & PARAMETERS ---
+    nut_thickness = 6.0          # Thickness along X axis (mm)
+    nut_x_start = span_end_x     # Aligned flush behind nut position at X = 864mm
+    fretboard_radius = 500.0     # Crown radius (mm)
+    edge_clearance = 3.0         # Distance from outer string edge to nut side edge (mm)
+    
+    # Imperial string gauges converted to mm
+    gauges_in_inches = [0.130, 0.105, 0.085, 0.065, 0.045, 0.030]  # B, E, A, D, G, C
+    string_diameters = [g * 25.4 for g in gauges_in_inches]
+    
+    # Target height above fretboard surface at slot bottom (B = 1.60mm -> C = 1.30mm)
+    string_heights = [1.60 - (i / 5.0) * (1.60 - 1.30) for i in range(6)]
+
+    nut_width = width_headstock_nut
+    nut_y_min = center_y - (nut_width / 2.0)
+    nut_y_max = center_y + (nut_width / 2.0)
+
+    z_fretboard_surface = 17.0 + 7.0  # Z = 24.0mm
+    z_nut_base = z_fretboard_surface - 2.5  # Seated 2.5mm into core slot (Z = 21.5mm)
+
+    # --- 8.2 HANDEDNESS & GRADIENT HEIGHT CALCULATIONS ---
+    if is_left_handed:
+        # Left-handed: B string on Y_min (bottom), C string on Y_max (top)
+        y_b_center = nut_y_min + edge_clearance + (string_diameters[0] / 2.0)
+        y_c_center = nut_y_max - edge_clearance - (string_diameters[5] / 2.0)
+        y_b_edge = nut_y_min
+        y_c_edge = nut_y_max
+    else:
+        # Right-handed: B string on Y_max (top), C string on Y_min (bottom)
+        y_b_center = nut_y_max - edge_clearance - (string_diameters[0] / 2.0)
+        y_c_center = nut_y_min + edge_clearance + (string_diameters[5] / 2.0)
+        y_b_edge = nut_y_max
+        y_c_edge = nut_y_min
+
+    string_centers_y = [
+        y_b_center + (i / 5.0) * (y_c_center - y_b_center) for i in range(6)
+    ]
+
+    # Nut top crest height above fretboard = Slot Bottom Height + 1.0x String Diameter
+    h_b_top = 2.5 + string_heights[0] + string_diameters[0]  
+    h_c_top = 2.5 + string_heights[5] + string_diameters[5]  
+
+    # --- 8.3 BUILD GRADIENT TAPERED NUT BLANK ---
+    def get_crowned_z(y, y_edge_b, h_b, y_edge_c, h_c):
+        ry = y - center_y
+        z_crown_rel = math.sqrt(fretboard_radius**2 - ry**2) - math.sqrt(fretboard_radius**2 - (nut_width/2.0)**2)
+        t = (y - y_edge_b) / (y_edge_c - y_edge_b)
+        h_grad = h_b + t * (h_c - h_b)
+        return z_nut_base + h_grad + z_crown_rel
+
+    num_pts = 16
+    wire_pts = []
+    for i in range(num_pts + 1):
+        curr_y = y_b_edge + (i / float(num_pts)) * (y_c_edge - y_b_edge)
+        curr_z = get_crowned_z(curr_y, y_b_edge, h_b_top, y_c_edge, h_c_top)
+        wire_pts.append(App.Vector(nut_x_start, curr_y, curr_z))
+
+    top_curve = Part.BSplineCurve()
+    top_curve.interpolate(wire_pts)
+    e_top = top_curve.toShape()
+
+    p_bot_b = App.Vector(nut_x_start, y_b_edge, z_nut_base)
+    p_bot_c = App.Vector(nut_x_start, y_c_edge, z_nut_base)
+
+    e_side_b = Part.makeLine(wire_pts[0], p_bot_b)
+    e_bottom = Part.makeLine(p_bot_b, p_bot_c)
+    e_side_c = Part.makeLine(p_bot_c, wire_pts[-1])
+
+    nut_wire = Part.Wire([e_top, e_side_c, e_bottom, e_side_b])
+    nut_sculpted = Part.Face(nut_wire).extrude(App.Vector(nut_thickness, 0, 0))
+
+    # --- 8.4 FILLET ONLY REAR VERTICAL CORNERS (TUNER SIDE) ---
+    rear_vertical_edges = []
+    for edge in nut_sculpted.Edges:
+        bbox = edge.BoundBox
+        is_vert_side = abs(bbox.XMin - bbox.XMax) < 0.1 and abs(bbox.ZMax - bbox.ZMin) > 2.0
+        is_outer_y = abs(bbox.Center.y - nut_y_min) < 1.0 or abs(bbox.Center.y - nut_y_max) < 1.0
+        # Exclude front edges facing fretboard (X = nut_x_start) to keep seamless joint
+        is_rear_x = abs(bbox.Center.x - (nut_x_start + nut_thickness)) < 0.2
+        
+        if is_vert_side and is_outer_y and is_rear_x:
+            rear_vertical_edges.append(edge)
+
+    if rear_vertical_edges:
+        for r_side in [2.0, 1.5, 1.0]:
+            try:
+                temp_nut = nut_sculpted.makeFillet(r_side, rear_vertical_edges)
+                if temp_nut and temp_nut.isValid() and temp_nut.Volume > 0:
+                    nut_sculpted = temp_nut
+                    break
+            except Exception:
+                pass
+
+    # --- 8.5 CARVE OPEN U-SHAPED SLOTS ---
+    slot_cutters = []
+    for i in range(6):
+        sy = string_centers_y[i]
+        s_dia = string_diameters[i]
+        s_h = string_heights[i]
+
+        ry = sy - center_y
+        z_crown = (z_fretboard_surface - fretboard_radius) + math.sqrt(fretboard_radius**2 - ry**2)
+        z_slot_bottom = z_crown + s_h
+
+        # Cylinder forms the rounded 180-degree bottom saddle
+        cyl_slot = Part.makeCylinder(
+            s_dia / 2.0, nut_thickness + 2.0,
+            App.Vector(nut_x_start - 1.0, sy, z_slot_bottom + (s_dia / 2.0)),
+            App.Vector(1, 0, 0)
+        )
+        
+        # Box cutter extends 15mm UPWARDS to guarantee a clean open top slot
+        box_slot = Part.makeBox(
+            nut_thickness + 2.0, s_dia, 15.0,
+            App.Vector(nut_x_start - 1.0, sy - (s_dia / 2.0), z_slot_bottom + (s_dia / 2.0))
+        )
+        slot_cutters.extend([cyl_slot, box_slot])
+
+    nut_sculpted = nut_sculpted.cut(Part.makeCompound(slot_cutters))
+
+    # --- 8.6 FILLET TUNER-SIDE ROLLED SADDLE EDGES ---
+    tuner_side_edges = []
+    for edge in nut_sculpted.Edges:
+        bbox = edge.BoundBox
+        is_tuner_x = abs(bbox.Center.x - (nut_x_start + nut_thickness)) < 0.2
+        is_top_z = bbox.ZMin > z_fretboard_surface
+        if is_tuner_x and is_top_z:
+            tuner_side_edges.append(edge)
+
+    if tuner_side_edges:
+        for r_tuner in [1.0, 0.8, 0.5]:
+            try:
+                temp_nut = nut_sculpted.makeFillet(r_tuner, tuner_side_edges)
+                if temp_nut and temp_nut.isValid() and temp_nut.Volume > 0:
+                    nut_sculpted = temp_nut
+                    break
+            except Exception:
+                pass
+
+    # --- 8.7 ADD NUT FEATURE TO FREECAD DOCUMENT ---
+    nut_feature = doc.addObject("Part::Feature", "CustomNut")
+    nut_feature.Shape = nut_sculpted
+    nut_feature.ViewObject.ShapeColor = (0.22, 0.22, 0.24)  # Graphite / Tusq look
+    nut_feature.Label = "CustomNut"
+    App.Console.PrintMessage("Successfully generated custom gradient 6-string nut with flush fretboard interface.\n")
+
+except Exception as nut_err:
+    App.Console.PrintError(f"Failed to generate custom nut: {str(nut_err)}\n")
+
 doc.recompute()
 gc.collect()
