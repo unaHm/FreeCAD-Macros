@@ -1352,5 +1352,264 @@ try:
 except Exception as nut_err:
     App.Console.PrintError(f"Failed to generate custom nut: {str(nut_err)}\n")
 
+# ==========================================
+# --- 9. ROUTING TEMPLATES GENERATION -----
+# ==========================================
+
+template_thickness = 12.0  # Standard MDF / Acrylic template thickness (mm)
+z_template_base = -60.0    # Offset plane to avoid visual overlap
+
+# --- HELPER: Extrude True SVG Silhouette Wire ---
+def build_contour_template(svg_filepath, cutters_list, name, color_rgb, translation_vector=App.Vector(0,0,0)):
+    try:
+        # Import SVG to get exact planar perimeter
+        old_objs = set(doc.Objects)
+        importSVG.insert(svg_filepath, doc.Name)
+        doc.recompute()
+        
+        new_objs = [o for o in doc.Objects if o not in old_objs and hasattr(o, 'Shape') and not o.Shape.isNull()]
+        
+        if not new_objs:
+            return None
+            
+        # Find largest outer contour shape
+        outer_obj = max(new_objs, key=lambda o: (o.Shape.BoundBox.XMax - o.Shape.BoundBox.XMin) * (o.Shape.BoundBox.YMax - o.Shape.BoundBox.YMin))
+        wire_shape = outer_obj.Shape.OuterWire if hasattr(outer_obj.Shape, "OuterWire") else outer_obj.Shape.Wires[0]
+        
+        template_face = Part.Face(wire_shape)
+        template_solid = template_face.extrude(App.Vector(0, 0, template_thickness))
+        
+        # Apply body translation alignment
+        if translation_vector.Length > 0:
+            template_solid.translate(translation_vector)
+            
+        # Shift to template Z height
+        template_solid.translate(App.Vector(0, 0, z_template_base - template_solid.BoundBox.ZMin))
+
+        # Cleanup temporary SVG import objects
+        for o in new_objs:
+            try: doc.removeObject(o.Name)
+            except Exception: pass
+
+        # Cut holes, pockets, and channels
+        if cutters_list:
+            comp_cutters = Part.makeCompound(cutters_list)
+            template_solid = template_solid.cut(comp_cutters)
+
+        feat = doc.addObject("Part::Feature", name)
+        feat.Shape = template_solid
+        feat.ViewObject.ShapeColor = color_rgb
+        feat.ViewObject.Transparency = 20
+        feat.Label = name
+        return feat
+    except Exception as template_err:
+        App.Console.PrintError(f"Failed to generate template {name}: {str(template_err)}\n")
+        return None
+
+
+# --- 9.1 STRUCTURAL CORE TEMPLATE (FLAT SOLID EXTRUSION METHOD) ---
+core_template_cutters = []
+
+# 1. Pilot Holes: 12-Node Array (3.0mm pilot)
+for x in [-15.0, 15.0]:
+    for y in [-45.0, -27.0, -9.0, 9.0, 27.0, 45.0]:
+        core_template_cutters.append(
+            Part.makeCylinder(1.5, 50.0, App.Vector(x, y, z_template_base - 5.0), App.Vector(0, 0, 1))
+        )
+
+# 2. Pilot Holes: M5 Core Mounts (2.5mm pilot)
+for mx in m5_screw_x_coords:
+    for my in m5_screw_y_coords:
+        core_template_cutters.append(
+            Part.makeCylinder(2.5, 50.0, App.Vector(mx, my * side_multiplier, z_template_base - 5.0), App.Vector(0, 0, 1))
+        )
+
+# 3. Pilot Holes: Tuner Pegs (3.0mm center pilot)
+for t_cyl in tuner_cutters:
+    t_center = t_cyl.BoundBox.Center
+    core_template_cutters.append(
+        Part.makeCylinder(1.5, 50.0, App.Vector(t_center.x, t_center.y, z_template_base - 5.0), App.Vector(0, 0, 1))
+    )
+
+# 4. Routing Voids: 3 DISCRETE INDIVIDUAL SLOTS (Truss Rod & CF Rods)
+if cf_wrap_thickness == 0.0:
+    cf_rod_w = 6.35
+    cf_offset_y = 15.0
+
+    # Left Carbon Fiber Rod Slot
+    cf_slot_left = Part.makeBox(
+        625.0, cf_rod_w, 50.0,
+        App.Vector(215.0, center_y - cf_offset_y - (cf_rod_w / 2.0), z_template_base - 5.0)
+    )
+    
+    # Right Carbon Fiber Rod Slot
+    cf_slot_right = Part.makeBox(
+        625.0, cf_rod_w, 50.0,
+        App.Vector(215.0, center_y + cf_offset_y - (cf_rod_w / 2.0), z_template_base - 5.0)
+    )
+
+    # Center Truss Rod Slot
+    truss_slot = Part.makeBox(
+        610.0, 6.35, 50.0,
+        App.Vector(neck_stop_x, center_y - 6.35 / 2.0, z_template_base - 5.0)
+    )
+
+    # Truss Rod Access Pocket
+    truss_access_void = Part.makeBox(
+        35.5, 10.0, 50.0,
+        App.Vector(neck_stop_x - 30.0, center_y - 10.0 / 2.0, z_template_base - 5.0)
+    )
+
+    core_template_cutters.extend([cf_slot_left, cf_slot_right, truss_slot, truss_access_void])
+
+try:
+    y_heel = width_heel / 2.0
+    y_bridge = bridge_core_width / 2.0
+    y_nut = width_headstock_nut / 2.0
+
+    # A. Rectangular Bridge Block (Flat Extrusion)
+    poly_brg = Part.makePolygon([
+        App.Vector(bridge_start_x, -y_bridge, z_template_base),
+        App.Vector(taper_start_x, -y_bridge, z_template_base),
+        App.Vector(taper_start_x, y_bridge, z_template_base),
+        App.Vector(bridge_start_x, y_bridge, z_template_base),
+        App.Vector(bridge_start_x, -y_bridge, z_template_base)
+    ])
+    t_bridge_block = Part.Face(poly_brg).extrude(App.Vector(0, 0, template_thickness))
+
+    # B. Tapered Bridge-to-Heel Transition
+    poly_taper = Part.makePolygon([
+        App.Vector(taper_start_x, -y_bridge, z_template_base),
+        App.Vector(neck_stop_x, -y_heel, z_template_base),
+        App.Vector(neck_stop_x, y_heel, z_template_base),
+        App.Vector(taper_start_x, y_bridge, z_template_base),
+        App.Vector(taper_start_x, -y_bridge, z_template_base)
+    ])
+    t_taper_block = Part.Face(poly_taper).extrude(App.Vector(0, 0, template_thickness))
+
+    # C. Playing Length Neck Taper (Heel to Nut)
+    poly_neck = Part.makePolygon([
+        App.Vector(neck_stop_x, -y_heel, z_template_base),
+        App.Vector(span_end_x, -y_nut, z_template_base),
+        App.Vector(span_end_x, y_nut, z_template_base),
+        App.Vector(neck_stop_x, y_heel, z_template_base),
+        App.Vector(neck_stop_x, -y_heel, z_template_base)
+    ])
+    t_neck_block = Part.Face(poly_neck).extrude(App.Vector(0, 0, template_thickness))
+
+    # D. Headstock SVG Solid Flat Extrusion
+    t_headstock_block = headstock_svg_face.extrude(App.Vector(0, 0, template_thickness))
+    t_headstock_block.translate(App.Vector(0, 0, z_template_base - t_headstock_block.BoundBox.ZMin))
+
+    # E. Fuse primitive solids into unified flat template shape
+    core_solid_template = t_bridge_block.fuse(t_taper_block).fuse(t_neck_block).fuse(t_headstock_block)
+
+    # F. Cut holes, rod channels, and tuner pilots
+    if core_template_cutters:
+        core_solid_template = core_solid_template.cut(Part.makeCompound(core_template_cutters))
+
+    feat_c = doc.addObject("Part::Feature", "Template_StructuralCore")
+    feat_c.Shape = core_solid_template
+    feat_c.ViewObject.ShapeColor = (0.85, 0.85, 0.20)
+    feat_c.ViewObject.Transparency = 20
+    feat_c.Label = "Template_StructuralCore"
+    App.Console.PrintMessage("Successfully generated exact flat-extruded Structural Core template.\n")
+
+except Exception as core_t_err:
+    App.Console.PrintError(f"Failed Structural Core template generation: {str(core_t_err)}\n")
+
+# --- 9.2 FINAL BODY SHELL - FRONT TEMPLATE ---
+body_front_cutters = []
+
+# 1. Routing Void: Core Pocket Area matching Template_StructuralCore outline
+if 'core_solid_template' in locals() and core_solid_template:
+    try:
+        core_pocket_void = core_solid_template.extrude(App.Vector(0, 0, 50.0))
+        core_pocket_void.translate(App.Vector(0, 0, z_template_base - 10.0))
+        body_front_cutters.append(core_pocket_void)
+    except Exception:
+        poly_pocket = Part.makePolygon([
+            App.Vector(bridge_start_x, -y_bridge, z_template_base - 5.0),
+            App.Vector(taper_start_x, -y_bridge, z_template_base - 5.0),
+            App.Vector(neck_stop_x, -y_heel, z_template_base - 5.0),
+            App.Vector(neck_stop_x, y_heel, z_template_base - 5.0),
+            App.Vector(taper_start_x, y_bridge, z_template_base - 5.0),
+            App.Vector(bridge_start_x, y_bridge, z_template_base - 5.0),
+            App.Vector(bridge_start_x, -y_bridge, z_template_base - 5.0)
+        ])
+        body_front_cutters.append(Part.Face(poly_pocket).extrude(App.Vector(0, 0, 50.0)))
+
+# 2. Pilot Holes & Pass-Throughs for Pot / Control Holes
+if "pot_holes" in FILES:
+    old_objs = set(doc.Objects)
+    try:
+        importSVG.insert(FILES["pot_holes"], doc.Name)
+        doc.recompute()
+        pot_svg_objs = [o for o in doc.Objects if o not in old_objs and hasattr(o, 'Shape') and not o.Shape.isNull()]
+
+        if pot_svg_objs:
+            # Calculate overall bounding box for the entire SVG group to preserve relative coordinates
+            group_xmin = min(o.Shape.BoundBox.XMin for o in pot_svg_objs)
+            group_xmax = max(o.Shape.BoundBox.XMax for o in pot_svg_objs)
+            group_ymin = min(o.Shape.BoundBox.YMin for o in pot_svg_objs)
+            group_ymax = max(o.Shape.BoundBox.YMax for o in pot_svg_objs)
+
+            group_cx = (group_xmin + group_xmax) / 2.0
+            group_cy = (group_ymin + group_ymax) / 2.0
+
+            for p_obj in pot_svg_objs:
+                r, center = get_circle_properties(p_obj.Shape)
+                
+                # Transform local SVG center to aligned control placement
+                cx = (center.x - group_cx)
+                cy = (center.y - group_cy) + controls_y
+
+                # Set radius: 1.5mm pilot for holes > 3mm dia (R > 1.5mm), else keep original radius
+                cutter_r = 1.5 if r > 1.5 else r
+                
+                pot_pilot = Part.makeCylinder(cutter_r, 50.0, App.Vector(cx, cy, z_template_base - 5.0), App.Vector(0, 0, 1))
+                body_front_cutters.append(pot_pilot)
+
+        for p_obj in pot_svg_objs:
+            try: doc.removeObject(p_obj.Name)
+            except Exception: pass
+
+    except Exception as pot_err:
+        App.Console.PrintWarning(f"Pot hole pilot extraction failed: {str(pot_err)}\n")
+
+build_contour_template(FILES["body_contour"], body_front_cutters, "Template_BodyShell_Front", (0.20, 0.70, 0.85), body_translation)
+
+# --- 9.3 FINAL BODY SHELL - BACK TEMPLATE (CONTROL CAVITY SIDE) ---
+body_back_cutters = []
+
+# Control Cavity & Flange Ledge Route Voids
+for key in ["cavity", "cavity_flange"]:
+    if key in FILES:
+        cav_void = create_svg_solid(FILES[key], 50.0, f"{key}_TemplateVoid", doc)
+        if cav_void:
+            b_c = cav_void.BoundBox
+            cav_void.translate(App.Vector(-((b_c.XMin + b_c.XMax) / 2.0), -((b_c.YMin + b_c.YMax) / 2.0), z_template_base - 5.0))
+            cav_void.translate(App.Vector(0.0, controls_y, 0.0))
+            body_back_cutters.append(cav_void)
+
+# Pilot Holes: M3 Ledge Screws (1.5mm pilot)
+for pt in m3_coords:
+    body_back_cutters.append(
+        Part.makeCylinder(1.5, 50.0, App.Vector(pt.x, pt.y, z_template_base - 5.0), App.Vector(0, 0, 1))
+    )
+
+# Pilot Holes: M5 Core Pass-Through Screws (2.75mm pilot)
+for mx in m5_screw_x_coords:
+    for my in m5_screw_y_coords:
+        body_back_cutters.append(
+            Part.makeCylinder(2.75, 50.0, App.Vector(mx, my * side_multiplier, z_template_base - 5.0), App.Vector(0, 0, 1))
+        )
+
+# Pilot Holes: Strap Buttons (1.5mm pilot)
+body_back_cutters.append(Part.makeCylinder(1.5, 50.0, App.Vector(butt_x, -45.0, z_template_base - 5.0), App.Vector(0, 0, 1)))
+body_back_cutters.append(Part.makeCylinder(1.5, 50.0, App.Vector(horn_x, horn_y, z_template_base - 5.0), App.Vector(0, 0, 1)))
+
+build_contour_template(FILES["body_contour"], body_back_cutters, "Template_BodyShell_Back", (0.85, 0.40, 0.85), body_translation)
+
 doc.recompute()
 gc.collect()
