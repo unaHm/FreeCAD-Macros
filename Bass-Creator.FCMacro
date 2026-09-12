@@ -22,6 +22,9 @@ draft_prefs.SetFloat("svgDiscretization", 0.05)    # Smooth curve discretization
 is_left_handed = True  
 side_multiplier = -1 if is_left_handed else 1
 
+# Optional Hardware Features
+include_gk_channel = False  # Set to True to generate internal GK-3 wire tube passage
+
 # Carbon Fiber wrap allowance (in mm)
 cf_wrap_thickness = 0.0  # Set to 0.0 for un-shrunk single-piece core with truss/CF rods & logo
 
@@ -696,30 +699,34 @@ if cf_wrap_thickness == 0.0 and "logo" in FILES:
         App.Console.PrintError(f"Failed to process headstock logo: {str(logo_err)}\n")
 
 gk_channel_solid = None
-try:
-    p_start_gk = App.Vector(40.0, 0.0, 15.0)
-    pts_gk = [
-        p_start_gk,
-        App.Vector(40.0, controls_y * 0.05, 5.0),    
-        App.Vector(40.0, controls_y * 0.12, -10.0),  
-        App.Vector(38.0, controls_y * 0.22, -22.0),  
-        App.Vector(30.0, controls_y * 0.45, -22.0),  
-        App.Vector(15.0, controls_y * 0.75, -22.0),  
-        App.Vector(0.0, controls_y, -22.0)           
-    ]
-    
-    curve_gk = Part.BSplineCurve()
-    curve_gk.interpolate(pts_gk)
-    path_wire_gk = Part.Wire([curve_gk.toShape()])
-    
-    initial_dir = (pts_gk[1] - pts_gk[0]).normalize()
-    circle_gk = Part.makeCircle(5.0, p_start_gk, initial_dir)  
-    circle_face_gk = Part.Face(Part.Wire([circle_gk]))
-    
-    gk_channel_solid = path_wire_gk.makePipe(circle_face_gk)
-    structural_core = structural_core.cut(gk_channel_solid)
-except Exception as gk_core_err:
-    App.Console.PrintWarning(f"Core wire tubing cut failed: {str(gk_core_err)}\n")
+if include_gk_channel:
+    try:
+        p_start_gk = App.Vector(40.0, 0.0, 15.0)
+        pts_gk = [
+            p_start_gk,
+            App.Vector(40.0, controls_y * 0.05, 5.0),    
+            App.Vector(40.0, controls_y * 0.12, -10.0),  
+            App.Vector(38.0, controls_y * 0.22, -22.0),  
+            App.Vector(30.0, controls_y * 0.45, -22.0),  
+            App.Vector(15.0, controls_y * 0.75, -22.0),  
+            App.Vector(0.0, controls_y, -22.0)           
+        ]
+        
+        curve_gk = Part.BSplineCurve()
+        curve_gk.interpolate(pts_gk)
+        path_wire_gk = Part.Wire([curve_gk.toShape()])
+        
+        initial_dir = (pts_gk[1] - pts_gk[0]).normalize()
+        circle_gk = Part.makeCircle(5.0, p_start_gk, initial_dir)  
+        circle_face_gk = Part.Face(Part.Wire([circle_gk]))
+        
+        gk_channel_solid = path_wire_gk.makePipe(circle_face_gk)
+        structural_core = structural_core.cut(gk_channel_solid)
+        App.Console.PrintMessage("Cut GK-3 pickup wire channel into Structural Core.\n")
+    except Exception as gk_core_err:
+        App.Console.PrintWarning(f"Core wire tubing cut failed: {str(gk_core_err)}\n")
+else:
+    App.Console.PrintMessage("Skipped GK-3 pickup wire channel (include_gk_channel = False).\n")
 
 core_feature = doc.addObject("Part::Feature", "StructuralCore")
 core_feature.Shape = structural_core
@@ -1034,9 +1041,10 @@ if body_solid_shape and not body_solid_shape.isNull():
     except Exception as strap_err:
         App.Console.PrintWarning(f"Strap button hole processing failed: {str(strap_err)}\n")
 
-    if gk_channel_solid and not gk_channel_solid.isNull():
+    if include_gk_channel and gk_channel_solid and not gk_channel_solid.isNull():
         try:
             body_solid_shape = body_solid_shape.cut(gk_channel_solid)
+            App.Console.PrintMessage("Cut GK-3 pickup wire channel into Body Shell.\n")
         except Exception as gk_body_err:
             App.Console.PrintWarning(f"Body wire tubing cut failed: {str(gk_body_err)}\n")
 
@@ -1433,7 +1441,7 @@ for t_cyl in tuner_cutters:
 
 # 4. Routing Voids: 3 DISCRETE INDIVIDUAL SLOTS (Truss Rod & CF Rods)
 if cf_wrap_thickness == 0.0:
-    cf_rod_w = 6.35
+    cf_rod_w = 3.5
     cf_offset_y = 15.0
 
     # Left Carbon Fiber Rod Slot
@@ -1610,6 +1618,91 @@ body_back_cutters.append(Part.makeCylinder(1.5, 50.0, App.Vector(butt_x, -45.0, 
 body_back_cutters.append(Part.makeCylinder(1.5, 50.0, App.Vector(horn_x, horn_y, z_template_base - 5.0), App.Vector(0, 0, 1)))
 
 build_contour_template(FILES["body_contour"], body_back_cutters, "Template_BodyShell_Back", (0.85, 0.40, 0.85), body_translation)
+
+# ==========================================
+# --- 10. ERGONOMIC ANGLED WEDGE SLEDS ----
+# ==========================================
+
+# --- 10.1 FOREARM SLANT ANGLED WEDGE SLED ---
+try:
+    # 1. Base block resting flat on top body surface (Z = 13.0mm)
+    sled_w, sled_l, sled_h = 350.0, 250.0, 50.0
+    x_start_fa = -350.0
+    y_start_fa = -150.0 if is_left_handed else -50.0
+    
+    base_block_fa = Part.makeBox(sled_w, sled_l, sled_h, App.Vector(x_start_fa, y_start_fa, 13.0))
+
+    # 2. Angled cutter plane (10 deg drop) to slope the top surface of the sled
+    cutter_plane_fa = Part.makeBox(sled_w + 100.0, sled_l + 100.0, sled_h + 20.0)
+    y_box_offset = -250 if is_left_handed else 0
+    
+    placement_fa = App.Placement(
+        App.Vector(-310.0, -40.0 + y_box_offset, 13.0),
+        App.Rotation(App.Vector(1.0, 0.15 * side_multiplier, 0.0), -10.0 * side_multiplier),
+        App.Vector(0, -y_box_offset, 0)
+    )
+    cutter_plane_fa.transformShape(placement_fa.toMatrix())
+
+    # 3. Trim top off base block to form a 10-degree wedge
+    forearm_wedge = base_block_fa.cut(cutter_plane_fa)
+
+    # 4. Punch central routing window through the wedge
+    window_void_fa = Part.makeBox(
+        220.0, 120.0, 100.0,
+        App.Vector(-300.0, -100.0 if is_left_handed else -20.0, -10.0)
+    )
+    forearm_sled_solid = forearm_wedge.cut(window_void_fa)
+
+    feat_fa = doc.addObject("Part::Feature", "Template_ForearmSled")
+    feat_fa.Shape = forearm_sled_solid
+    feat_fa.ViewObject.ShapeColor = (0.20, 0.85, 0.40)
+    feat_fa.ViewObject.Transparency = 30
+    feat_fa.Label = "Template_ForearmSled"
+    App.Console.PrintMessage("Successfully generated Forearm Slant Angled Wedge Sled.\n")
+
+except Exception as fa_err:
+    App.Console.PrintError(f"Failed Forearm wedge sled generation: {str(fa_err)}\n")
+
+
+# --- 10.2 BELLY SCOOP ANGLED WEDGE SLED ---
+try:
+    # 1. Base block resting flat against back body surface (Z = -31.0mm)
+    sled_w_b, sled_l_b, sled_h_b = 350.0, 250.0, 50.0
+    x_start_bs = 80.0
+    y_start_bs = -150.0 if is_left_handed else -50.0
+
+    base_block_bs = Part.makeBox(sled_w_b, sled_l_b, sled_h_b, App.Vector(x_start_bs, y_start_bs, -31.0 - sled_h_b))
+
+    # 2. Angled cutter plane (12 deg drop) to slope the reference surface of the sled
+    cutter_plane_bs = Part.makeBox(sled_w_b + 100.0, sled_l_b + 100.0, sled_h_b + 20.0)
+    y_belly_offset = -200 if is_left_handed else 0
+    
+    placement_bs = App.Placement(
+        App.Vector(120.0, 50.0 * side_multiplier + y_belly_offset, -31.0),
+        App.Rotation(App.Vector(1.0, -0.10 * side_multiplier, 0.0), 12.0 * side_multiplier),
+        App.Vector(0, -y_belly_offset, 0)
+    )
+    cutter_plane_bs.transformShape(placement_bs.toMatrix())
+
+    # 3. Trim base block to form 12-degree wedge
+    belly_wedge = base_block_bs.cut(cutter_plane_bs)
+
+    # 4. Punch central routing window through the wedge
+    window_void_bs = Part.makeBox(
+        220.0, 120.0, 100.0,
+        App.Vector(110.0, -80.0 if is_left_handed else 0.0, -80.0)
+    )
+    belly_sled_solid = belly_wedge.cut(window_void_bs)
+
+    feat_bs = doc.addObject("Part::Feature", "Template_BellyScoopSled")
+    feat_bs.Shape = belly_sled_solid
+    feat_bs.ViewObject.ShapeColor = (0.85, 0.40, 0.20)
+    feat_bs.ViewObject.Transparency = 30
+    feat_bs.Label = "Template_BellyScoopSled"
+    App.Console.PrintMessage("Successfully generated Belly Scoop Angled Wedge Sled.\n")
+
+except Exception as bs_err:
+    App.Console.PrintError(f"Failed Belly Scoop wedge sled generation: {str(bs_err)}\n")
 
 doc.recompute()
 gc.collect()
