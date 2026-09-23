@@ -1704,5 +1704,99 @@ try:
 except Exception as bs_err:
     App.Console.PrintError(f"Failed Belly Scoop wedge sled generation: {str(bs_err)}\n")
 
+# ==========================================
+# --- 8.8 HEADSTOCK TOP VENEER (1MM) ------
+# ==========================================
+
+try:
+    if "headstock" in FILES:
+        z_veneer_top = z_neck_top + 2.0  # Floating 2mm above headstock face to avoid interactions
+
+        # 1. Extrude 1.0mm thick main headstock plate from SVG
+        veneer_headstock = create_svg_solid(FILES["headstock"], 1.0, "HeadstockVeneerSolid", doc)
+        
+        if veneer_headstock:
+            # Shift main headstock plate to target headstock coordinates
+            veneer_headstock.translate(App.Vector(target_x, target_y, z_veneer_top - 1.0))
+
+            # 2. Loft transition veneer sheet between nut (X = 864mm) and volute boundary (X = 884mm)
+            wire_nut_v = create_semi_ellipse_wire(
+                span_end_x, center_y, width_headstock_nut, 1.0, z_top=z_veneer_top
+            )
+            wire_volute_v = create_asymmetric_rectangle_wire(
+                x_volute_end, y_min_hs, y_max_hs, 1.0, z_top=z_veneer_top
+            )
+            veneer_transition = Part.makeLoft([wire_nut_v, wire_volute_v], True)
+
+            # 3. Fuse aligned headstock plate and transition loft
+            veneer_solid = veneer_headstock.fuse(veneer_transition)
+
+            # 4. Trim overhang ONLY behind the nut interface (X < span_end_x)
+            trim_back_veneer = Part.makeBox(
+                200.0, 300.0, 100.0,
+                App.Vector(span_end_x - 200.0, -150.0, z_veneer_top - 50.0)
+            )
+            veneer_solid = veneer_solid.cut(trim_back_veneer)
+
+            # 5. Cut out CustomNut registration notch at X = 864mm (span_end_x)
+            try:
+                nut_notch_cutter = Part.makeBox(
+                    nut_thickness + 0.1,  # 6.1mm width for clearance
+                    width_headstock_nut + 2.0, 
+                    10.0,
+                    App.Vector(span_end_x, center_y - (width_headstock_nut / 2.0) - 1.0, z_veneer_top - 5.0)
+                )
+                
+                if 'nut_sculpted' in locals() and nut_sculpted:
+                    try:
+                        nut_exact_cutter = nut_sculpted.copy()
+                        nut_exact_cutter.translate(App.Vector(0, 0, 2.0))
+                        nut_exact_cutter = nut_exact_cutter.makeOffsetShape(0.1, 0.01, fill=True)
+                        if nut_exact_cutter and nut_exact_cutter.isValid():
+                            nut_notch_cutter = nut_exact_cutter
+                    except Exception:
+                        pass
+
+                veneer_solid = veneer_solid.cut(nut_notch_cutter)
+                App.Console.PrintMessage("Successfully cut CustomNut positioning notch out of HeadstockVeneer.\n")
+            except Exception as nut_notch_err:
+                App.Console.PrintWarning(f"Nut notch cut bypassed: {str(nut_notch_err)}\n")
+
+            # 6. Drill enlarged 25mm diameter tuner clearance holes through veneer
+            if tuner_cutters:
+                veneer_tuner_radius = 25.0 / 2.0  # 12.5mm radius
+                tuner_comp = Part.makeCompound([
+                    Part.makeCylinder(
+                        veneer_tuner_radius, 
+                        20.0, 
+                        App.Vector(t.BoundBox.Center.x, t.BoundBox.Center.y, z_veneer_top - 5.0), 
+                        App.Vector(0, 0, 1)
+                    ) for t in tuner_cutters
+                ])
+                veneer_solid = veneer_solid.cut(tuner_comp)
+
+            # 7. Cut 1.0mm logo pocket through floating veneer
+            if cf_wrap_thickness == 0.0 and "logo" in FILES and 'x_shift' in locals():
+                try:
+                    veneer_logo_cutter = create_svg_solid(FILES["logo"], 3.0, "VeneerLogoCutter", doc)
+                    if veneer_logo_cutter:
+                        veneer_logo_cutter.translate(App.Vector(x_shift, y_shift, z_veneer_top - 2.0))
+                        veneer_solid = veneer_solid.cut(veneer_logo_cutter)
+                        App.Console.PrintMessage("Successfully cut logo pocket through HeadstockVeneer.\n")
+                except Exception as v_logo_err:
+                    App.Console.PrintWarning(f"Veneer logo pocket cut bypassed: {str(v_logo_err)}\n")
+
+            # 8. Assign shape as standalone feature
+            standalone_veneer_shape = veneer_solid.copy()
+
+            veneer_feature = doc.addObject("Part::Feature", "HeadstockVeneer")
+            veneer_feature.Shape = standalone_veneer_shape
+            veneer_feature.ViewObject.ShapeColor = (0.20, 0.12, 0.08)  # Dark ebony aesthetic
+            veneer_feature.Label = "HeadstockVeneer"
+            App.Console.PrintMessage("Successfully generated complete 1.0mm HeadstockVeneer object with 25mm Tuner Washer Recesses.\n")
+
+except Exception as veneer_err:
+    App.Console.PrintError(f"Failed to generate headstock veneer: {str(veneer_err)}\n")
+
 doc.recompute()
 gc.collect()
