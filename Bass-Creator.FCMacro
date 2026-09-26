@@ -23,7 +23,7 @@ is_left_handed = True
 side_multiplier = -1 if is_left_handed else 1
 
 # Optional Hardware Features
-include_gk_channel = False  # Set to True to generate internal GK-3 wire tube passage
+include_gk_channel = True  # Set to True to generate internal GK-3 wire tube passage
 
 # Carbon Fiber wrap allowance (in mm)
 cf_wrap_thickness = 0.0  # Set to 0.0 for un-shrunk single-piece core with truss/CF rods & logo
@@ -1797,6 +1797,188 @@ try:
 
 except Exception as veneer_err:
     App.Console.PrintError(f"Failed to generate headstock veneer: {str(veneer_err)}\n")
+
+# ==========================================
+# --- 8.9 CORE BODY TOP VENEER (1MM) ------
+# ==========================================
+
+try:
+    # Landmarks for core body top veneer (X = 30mm to X = 211mm)
+    v_body_x_start = 30.0
+    v_body_x_end = neck_stop_x  # X = 211.0mm
+    z_step_top = z_step_interface  # Z = 13.0mm (Top surface of step)
+    outer_corner_radius = 2.0      # Vertical corner radius (mm)
+    top_edge_radius = 0.6          # Roundover radius for outer top perimeter edges (mm)
+    seam_fillet_radius = 0.8       # Fillet radius where finger ramp joins veneer plate (mm)
+
+    # 1. Determine target bottom Z plane based on FingerRamp's ZMin
+    if 'ramp_solid' in locals() and ramp_solid and not ramp_solid.isNull():
+        z_veneer_bottom = ramp_solid.BoundBox.ZMin
+        veneer_thickness = z_step_top - z_veneer_bottom
+    else:
+        z_veneer_bottom = z_step_top - 1.0
+        veneer_thickness = 1.0
+
+    # 2. Reconstruct 2D tapered profile matching core bridge block & neck heel
+    y_heel = width_heel / 2.0
+    y_bridge = bridge_core_width / 2.0
+
+    def get_core_taper_width(x):
+        if x <= taper_start_x:
+            return y_bridge
+        elif x >= neck_stop_x:
+            return y_heel
+        else:
+            t = (x - taper_start_x) / (neck_stop_x - taper_start_x)
+            return y_bridge + t * (y_heel - y_bridge)
+
+    y_start_width = get_core_taper_width(v_body_x_start)
+
+    # Build 2D boundary wire at matched bottom Z elevation
+    poly_body_veneer = Part.makePolygon([
+        App.Vector(v_body_x_start, -y_start_width, z_veneer_bottom),
+        App.Vector(taper_start_x, -y_bridge, z_veneer_bottom),
+        App.Vector(v_body_x_end, -y_heel, z_veneer_bottom),
+        App.Vector(v_body_x_end, y_heel, z_veneer_bottom),
+        App.Vector(taper_start_x, y_bridge, z_veneer_bottom),
+        App.Vector(v_body_x_start, y_start_width, z_veneer_bottom),
+        App.Vector(v_body_x_start, -y_start_width, z_veneer_bottom)
+    ])
+
+    # Extrude base plate sheet
+    body_veneer_face = Part.Face(poly_body_veneer)
+    body_veneer_solid = body_veneer_face.extrude(App.Vector(0, 0, veneer_thickness))
+
+    # 3. FILLET OUTER PLATE VERTICAL CORNERS
+    plate_vertical_edges = []
+    for edge in body_veneer_solid.Edges:
+        v1, v2 = edge.Vertexes[0].Point, edge.Vertexes[1].Point
+        is_vertical = (abs(v1.x - v2.x) < 1e-3) and (abs(v1.y - v2.y) < 1e-3) and (abs(v1.z - v2.z) > 1e-3)
+        is_at_neck_stop = max(v1.x, v2.x) >= (neck_stop_x - 0.5)
+
+        if is_vertical and not is_at_neck_stop:
+            plate_vertical_edges.append(edge)
+
+    if plate_vertical_edges:
+        try:
+            body_veneer_solid = body_veneer_solid.makeFillet(outer_corner_radius, plate_vertical_edges)
+            App.Console.PrintMessage("Filleted outer plate vertical edges successfully.\n")
+        except Exception as plate_f_err:
+            App.Console.PrintWarning(f"Plate corner filleting bypassed: {str(plate_f_err)}\n")
+
+    # 3.5 FILLET VENEER OUTER TOP EDGES (BEFORE RAMP FUSION)
+    ramp_x_start = ramp_solid.BoundBox.XMin if ('ramp_solid' in locals() and ramp_solid) else 0.0
+    ramp_x_end = ramp_solid.BoundBox.XMax if ('ramp_solid' in locals() and ramp_solid) else 0.0
+
+    top_outer_edges = []
+    for edge in body_veneer_solid.Edges:
+        v1, v2 = edge.Vertexes[0].Point, edge.Vertexes[1].Point
+        
+        is_at_top = abs(v1.z - z_step_top) < 1e-3 and abs(v2.z - z_step_top) < 1e-3
+        is_at_neck_stop = (v1.x >= neck_stop_x - 0.5) or (v2.x >= neck_stop_x - 0.5)
+        is_ramp_interface = (ramp_x_start - 1.0 <= v1.x <= ramp_x_end + 1.0) and (abs(v1.x - v2.x) < 1e-3)
+
+        if is_at_top and not is_at_neck_stop and not is_ramp_interface:
+            top_outer_edges.append(edge)
+
+    if top_outer_edges:
+        try:
+            body_veneer_solid = body_veneer_solid.makeFillet(top_edge_radius, top_outer_edges)
+            App.Console.PrintMessage("Filleted outer top veneer edges successfully.\n")
+        except Exception as top_f_err:
+            App.Console.PrintWarning(f"Top edge filleting bypassed: {str(top_f_err)}\n")
+
+    # 4. FUSE WITH FINGER RAMP
+    if 'ramp_solid' in locals() and ramp_solid:
+        try:
+            ramp_copy = ramp_solid.copy()
+            ramp_z_bottom_local = ramp_copy.BoundBox.ZMin
+            
+            # 4a. Fillet ramp vertical edges
+            ramp_vertical_edges = []
+            for r_edge in ramp_copy.Edges:
+                rv1, rv2 = r_edge.Vertexes[0].Point, r_edge.Vertexes[1].Point
+                if (abs(rv1.x - rv2.x) < 1e-3) and (abs(rv1.y - rv2.y) < 1e-3) and (abs(rv1.z - rv2.z) > 1e-3):
+                    ramp_vertical_edges.append(r_edge)
+
+            if ramp_vertical_edges:
+                try:
+                    ramp_copy = ramp_copy.makeFillet(outer_corner_radius, ramp_vertical_edges)
+                except Exception:
+                    pass
+
+            # 4b. Fillet ramp top edges
+            ramp_top_edges = []
+            for r_edge in ramp_copy.Edges:
+                rv1, rv2 = r_edge.Vertexes[0].Point, r_edge.Vertexes[1].Point
+                # Any edge where both vertices sit comfortably above the bottom plane belongs to the top boundary
+                if (rv1.z > ramp_z_bottom_local + 0.5) and (rv2.z > ramp_z_bottom_local + 0.5):
+                    # Ensure we don't accidentally grab a vertical edge
+                    is_vert = (abs(rv1.x - rv2.x) < 1e-3) and (abs(rv1.y - rv2.y) < 1e-3) and (abs(rv1.z - rv2.z) > 1e-3)
+                    if not is_vert:
+                        ramp_top_edges.append(r_edge)
+
+            if ramp_top_edges:
+                try:
+                    # Apply the same matching top_edge_radius (0.6mm) to the finger ramp top
+                    ramp_copy = ramp_copy.makeFillet(top_edge_radius, ramp_top_edges)
+                    App.Console.PrintMessage("Filleted top edges of FingerRamp successfully.\n")
+                except Exception as rt_err:
+                    App.Console.PrintWarning(f"Ramp top edge filleting bypassed: {str(rt_err)}\n")
+
+            # 4c. Perform solid union
+            body_veneer_solid = body_veneer_solid.fuse(ramp_copy)
+            
+            if 'ramp_feature' in locals() and ramp_feature:
+                ramp_feature.ViewObject.Visibility = False
+                
+            App.Console.PrintMessage("Successfully fused pre-filleted FingerRamp and CoreBodyVeneer.\n")
+        except Exception as embed_err:
+            App.Console.PrintWarning(f"Finger ramp fusion bypassed: {str(embed_err)}\n")
+
+    # 5. FILLET JOIN SEAM AT INTERSECTION
+    seam_edges = []
+    for edge in body_veneer_solid.Edges:
+        v1, v2 = edge.Vertexes[0].Point, edge.Vertexes[1].Point
+        is_vertical = (abs(v1.x - v2.x) < 1e-3) and (abs(v1.y - v2.y) < 1e-3) and (abs(v1.z - v2.z) > 1e-3)
+        
+        if is_vertical and (v_body_x_start + 5.0 < v1.x < neck_stop_x - 5.0):
+            seam_edges.append(edge)
+
+    if seam_edges:
+        try:
+            body_veneer_solid = body_veneer_solid.makeFillet(seam_fillet_radius, seam_edges)
+            App.Console.PrintMessage("Filleted transition seam successfully.\n")
+        except Exception as seam_err:
+            App.Console.PrintWarning(f"Seam filleting bypassed gracefully: {str(seam_err)}\n")
+
+    # 6. CUT TRUSS ROD ACCESS SLOT
+    if cf_wrap_thickness == 0.0:
+        truss_veneer_cutter = Part.makeBox(
+            30.0, 10.0, 20.0, 
+            App.Vector(neck_stop_x - 30.0, center_y - 10.0 / 2.0, z_veneer_bottom - 5.0)
+        )
+        body_veneer_solid = body_veneer_solid.cut(truss_veneer_cutter)
+        App.Console.PrintMessage("Cut Truss Rod Access Slot out of CoreBodyVeneer.\n")
+
+    # 7. REFINE SHAPE: Merge coplanar bottom faces into a single face
+    try:
+        body_veneer_solid = body_veneer_solid.removeSplitter()
+        App.Console.PrintMessage("Refined CoreBodyVeneer topology: merged coplanar faces.\n")
+    except Exception as ref_err:
+        App.Console.PrintWarning(f"Shape refinement bypassed: {str(ref_err)}\n")
+
+    # 8. ISOLATE STANDALONE FEATURE
+    standalone_body_veneer = body_veneer_solid.copy()
+
+    core_veneer_feature = doc.addObject("Part::Feature", "CoreBodyVeneer")
+    core_veneer_feature.Shape = standalone_body_veneer
+    core_veneer_feature.ViewObject.ShapeColor = (0.20, 0.12, 0.08)  # Ebony / dark wood preview
+    core_veneer_feature.Label = "CoreBodyVeneer"
+    App.Console.PrintMessage("Successfully generated clean, unified CoreBodyVeneer object with full edge filleting.\n")
+
+except Exception as body_v_err:
+    App.Console.PrintError(f"Failed to generate core body veneer: {str(body_v_err)}\n")
 
 doc.recompute()
 gc.collect()
