@@ -890,7 +890,7 @@ if body_solid_shape and not body_solid_shape.isNull():
 if body_solid_shape and not body_solid_shape.isNull():
     # 1. Carve Main Control Cavities & Pot Pass-Throughs into Body Shell
     cavity_ops = [
-        ("cavity", 35.0, -32.0, "CavityRoute"),
+        ("cavity", 39.0, -32.0, "CavityRoute"),
         ("cavity_flange", 6.0, -32.0, "CavityFlangeRoute"),
         ("pot_holes", 50.0, -32.0, "PotHolesRoute")
     ]
