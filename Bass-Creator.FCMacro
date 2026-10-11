@@ -31,6 +31,11 @@ cf_wrap_thickness = 0.0  # Set to 0.0 for un-shrunk single-piece core with truss
 # 3D Printing Fit Clearance Offset (0.25mm per side = 0.5mm overall clearance)
 print_clearance = 0.25 
 
+# Enable full-length continuous carbon fiber tube tunnels for 3D printed cores
+is_3d_printed_core = True  
+cf_tube_od = 6.0    # Outer diameter of carbon fiber reinforcement tubes (mm)
+cf_tube_clearance = 0.20  # Print clearance allowance (0.1mm radial)
+
 FILES = {
     "body_contour": "/home/dan/Downloads/swainybass-2026-07-body.svg",
     "headstock": "/home/dan/Downloads/swainybass-2026-06-headstock-complete.svg",
@@ -596,23 +601,7 @@ else:
 
 # --- CONDITIONAL REINFORCEMENT & TRUSS ROD CUTTING ---
 if cf_wrap_thickness == 0.0:
-    # Carbon Fiber Rod Channels (Only cut when core is un-shrunk / un-wrapped)
-    cf_rod_length = 625.0  
-    cf_rod_width = 6.35
-    cf_rod_depth = 9.52 + 0.50  # 10.02mm depth
-    cf_y_offset = 15.0  
-
-    cf_channel_left = Part.makeBox(
-        cf_rod_length, cf_rod_width, cf_rod_depth,
-        App.Vector(215.0, center_y - cf_y_offset - (cf_rod_width / 2.0), z_neck_top - cf_rod_depth)
-    )
-
-    cf_channel_right = Part.makeBox(
-        cf_rod_length, cf_rod_width, cf_rod_depth,
-        App.Vector(215.0, center_y + cf_y_offset - (cf_rod_width / 2.0), z_neck_top - cf_rod_depth)
-    )
-
-    # Truss Rod Channel and Pocket Cutters
+    # 1. Truss Rod Channel and Pocket Cutters (Always present for relief adjustment)
     truss_rod_cutter = Part.makeBox(
         610.0, 6.35, 11.52, 
         App.Vector(neck_stop_x, center_y - 6.35 / 2.0, z_neck_top - 9.52)
@@ -628,12 +617,71 @@ if cf_wrap_thickness == 0.0:
         App.Vector(neck_stop_x - 30.0, center_y - 10.0 / 2.0, z_neck_top - 12.0)
     )
 
-    neck_reinforcement_cutters = Part.makeCompound([
-        cf_channel_left, cf_channel_right,
-        truss_rod_cutter, truss_rod_nut_pocket, access_cutter
-    ])
+    reinforcement_cutters = [truss_rod_cutter, truss_rod_nut_pocket, access_cutter]
+
+    # 2. Check if building for 3D Printing or CNC Milling
+    if 'is_3d_printed_core' in locals() and is_3d_printed_core:
+        # =========================================================================
+        # --- CONTINUOUS TAPER-ANGLED CF/STEEL TUBE TUNNELS (STRAIGHT RODS) -------
+        # =========================================================================
+        cf_tube_od = 6.0          # Uniform OD for rigid straight carbon/steel rods (mm)
+        cf_tube_clearance = 0.20  # 0.1mm radial clearance for 3D printing fit
+        
+        r_tube = (cf_tube_od / 2.0) + (cf_tube_clearance / 2.0)  # 3.1mm radius
+        z_tube_center = 9.5  # Keeps top of tube below z_step_interface (Z = 13.0mm)
+        
+        # Landmarks for angled straight vector
+        x_bridge_anchor = -15.0   # Anchor inside bridge block
+        x_hs_tip = 930.0          # Continues straight into headstock
+        
+        # Angled Y-positions following neck taper:
+        # Wider at the bridge (Y = ±22mm), narrowing at the nut/headstock (Y = ±11mm)
+        y_bridge_offset = 22.0  
+        y_hs_offset = 11.0      
+
+        for side in [-1, 1]:  # Left and Right sides
+            y_start = y_bridge_offset * side
+            y_end = y_hs_offset * side
+
+            p_start = App.Vector(x_bridge_anchor, y_start, z_tube_center)
+            p_end = App.Vector(x_hs_tip, y_end, z_tube_center)
+
+            # Direct vector and total length along angled axis
+            rod_axis = (p_end - p_start)
+            tube_length = rod_axis.Length
+            dir_vector = rod_axis.normalize()
+
+            # Single straight cylinder extruded along the angled trajectory
+            angled_tube_cyl = Part.makeCylinder(r_tube, tube_length, p_start, dir_vector)
+            
+            reinforcement_cutters.append(angled_tube_cyl)
+
+        App.Console.PrintMessage(f"Cut continuous TAPER-ANGLED {cf_tube_od}mm Rod Tunnels (X = -15mm to 930mm, Y = ±22mm -> ±11mm).\n")
+
+    else:
+        # =========================================================================
+        # --- STANDARD RECTANGULAR BLIND CHANNELS (CNC MILLED CORE) ---------------
+        # =========================================================================
+        cf_rod_length = 625.0  
+        cf_rod_width = 3.5
+        cf_rod_depth = 9.52 + 0.50  # 10.02mm depth
+        cf_y_offset = 15.0  
+
+        cf_channel_left = Part.makeBox(
+            cf_rod_length, cf_rod_width, cf_rod_depth,
+            App.Vector(215.0, center_y - cf_y_offset - (cf_rod_width / 2.0), z_neck_top - cf_rod_depth)
+        )
+
+        cf_channel_right = Part.makeBox(
+            cf_rod_length, cf_rod_width, cf_rod_depth,
+            App.Vector(215.0, center_y + cf_y_offset - (cf_rod_width / 2.0), z_neck_top - cf_rod_depth)
+        )
+        reinforcement_cutters.extend([cf_channel_left, cf_channel_right])
+        App.Console.PrintMessage("Cut standard rectangular CF channels into un-wrapped Core.\n")
+
+    neck_reinforcement_cutters = Part.makeCompound(reinforcement_cutters)
     structural_core = structural_core.cut(neck_reinforcement_cutters)
-    App.Console.PrintMessage("Cut Truss Rod and Carbon Fiber channels into un-wrapped Core.\n")
+
 else:
     App.Console.PrintMessage("Skipped Truss Rod and CF channels (CF Wrap enabled: core rigid enough).\n")
 
@@ -1134,21 +1182,22 @@ try:
                 chip_sub_width = max(0.5, sub_width - (2.0 * print_clearance))
 
                 # Pocket Cutters (Full scale)
-                box_l = Part.makeBox(marker_length, sub_width, 2.0, App.Vector(marker_x - marker_length / 2.0, center_y - offset_y - sub_width / 2.0, z_pocket_start))
-                box_r = Part.makeBox(marker_length, sub_width, 2.0, App.Vector(marker_x - marker_length / 2.0, center_y + offset_y - sub_width / 2.0, z_pocket_start))
+                box_l = Part.makeBox(marker_length, sub_width, 4.0, App.Vector(marker_x - marker_length / 2.0, center_y - offset_y - sub_width / 2.0, z_pocket_start))
+                box_r = Part.makeBox(marker_length, sub_width, 4.0, App.Vector(marker_x - marker_length / 2.0, center_y + offset_y - sub_width / 2.0, z_pocket_start))
                 marker_cutters.extend([box_l, box_r])
 
                 # Marker Chips (Clearance applied)
-                chip_l = Part.makeBox(chip_length, chip_sub_width, 2.0, App.Vector(marker_x - chip_length / 2.0, center_y - offset_y - chip_sub_width / 2.0, z_pocket_start))
-                chip_r = Part.makeBox(chip_length, chip_sub_width, 2.0, App.Vector(marker_x - chip_length / 2.0, center_y + offset_y - chip_sub_width / 2.0, z_pocket_start))
+                chip_l = Part.makeBox(chip_length, chip_sub_width, 4.0, App.Vector(marker_x - chip_length / 2.0, center_y - offset_y - chip_sub_width / 2.0, z_pocket_start))
+                chip_r = Part.makeBox(chip_length, chip_sub_width, 4.0, App.Vector(marker_x - chip_length / 2.0, center_y + offset_y - chip_sub_width / 2.0, z_pocket_start))
                 marker_chips.extend([chip_l, chip_r])
             else:
-                box_marker = Part.makeBox(marker_length, marker_width, 2.0, App.Vector(marker_x - marker_length / 2.0, center_y - marker_width / 2.0, z_pocket_start))
+                box_marker = Part.makeBox(marker_length, marker_width, 4.0, App.Vector(marker_x - marker_length / 2.0, center_y - marker_width / 2.0, z_pocket_start))
                 marker_cutters.append(box_marker)
 
-                chip_marker = Part.makeBox(chip_length, chip_width, 2.0, App.Vector(marker_x - chip_length / 2.0, center_y - chip_width / 2.0, z_pocket_start))
+                chip_marker = Part.makeBox(chip_length, chip_width, 4.0, App.Vector(marker_x - chip_length / 2.0, center_y - marker_width / 2.0, z_pocket_start))
                 marker_chips.append(chip_marker)
             
+            # --- Side Marker Processing (Unchanged) ---
             ry_marker = w_marker / 2.0
             z_peak_marker = (17.0 + 7.0) - dip_m
             z_edge = (z_peak_marker - 500.0) + math.sqrt(500.0**2 - ry_marker**2)
@@ -1157,7 +1206,6 @@ try:
             edge_y = center_y + side_multiplier * ry_marker
             y_start = edge_y - 0.1 if side_multiplier == -1 else edge_y - sm_depth
             
-            # Shrunk Side Dot Chip Dimensions
             sm_chip_len = max(0.5, sm_length - (2.0 * print_clearance))
             sm_chip_h = max(0.5, sm_height - (2.0 * print_clearance))
 
@@ -1177,10 +1225,29 @@ try:
                 sm_chip = Part.makeBox(sm_chip_len, sm_depth, sm_chip_h, App.Vector(marker_x - sm_chip_len / 2.0, y_start, z_start_sm + print_clearance))
                 side_marker_chips.append(sm_chip)
 
-    # Standalone Fretboard Marker Chips (Shrunk for 0.5mm clearance fit)
+    # --- RADIUS CROWNING FOR MAIN FRET MARKER CHIPS ---
+    crowned_marker_chips = []
     if marker_chips:
+        try:
+            # Create a copy of the fretboard solid to use as the trimming volume
+            fb_crown_tool = fretboard_solid.copy()
+            
+            for chip in marker_chips:
+                # Intersect the taller marker block with the radiused fretboard volume
+                crowned_chip = chip.common(fb_crown_tool)
+                if crowned_chip and not crowned_chip.isNull() and crowned_chip.Volume > 0:
+                    crowned_marker_chips.append(crowned_chip)
+                else:
+                    crowned_marker_chips.append(chip)
+            App.Console.PrintMessage("Successfully crowned fretboard marker chips with 500mm radius.\n")
+        except Exception as crown_err:
+            App.Console.PrintWarning(f"Fret marker crowning bypassed: {str(crown_err)}\n")
+            crowned_marker_chips = marker_chips
+
+    # Standalone Fretboard Marker Chips (Crowned to Fretboard Radius)
+    if crowned_marker_chips:
         chips_feature = doc.addObject("Part::Feature", "FretMarkers")
-        chips_feature.Shape = Part.makeCompound(marker_chips)
+        chips_feature.Shape = Part.makeCompound(crowned_marker_chips)
         chips_feature.ViewObject.ShapeColor = (0.95, 0.95, 0.90)  # Off-white/pearl
         chips_feature.Label = "FretMarkers"
 
