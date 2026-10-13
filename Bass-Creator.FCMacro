@@ -624,11 +624,11 @@ if cf_wrap_thickness == 0.0:
         # =========================================================================
         # --- CONTINUOUS TAPER-ANGLED CF/STEEL TUBE TUNNELS (STRAIGHT RODS) -------
         # =========================================================================
-        cf_tube_od = 6.0          # Uniform OD for rigid straight carbon/steel rods (mm)
+        cf_tube_od = 8.0          # Uniform OD for rigid straight carbon/steel rods (mm)
         cf_tube_clearance = 0.20  # 0.1mm radial clearance for 3D printing fit
         
         r_tube = (cf_tube_od / 2.0) + (cf_tube_clearance / 2.0)  # 3.1mm radius
-        z_tube_center = 9.5  # Keeps top of tube below z_step_interface (Z = 13.0mm)
+        z_tube_center = 8.5  # Keeps top of tube below z_step_interface (Z = 13.0mm)
         
         # Landmarks for angled straight vector
         x_bridge_anchor = -15.0   # Anchor inside bridge block
@@ -1685,6 +1685,76 @@ body_back_cutters.append(Part.makeCylinder(1.5, 50.0, App.Vector(butt_x, -45.0, 
 body_back_cutters.append(Part.makeCylinder(1.5, 50.0, App.Vector(horn_x, horn_y, z_template_base - 5.0), App.Vector(0, 0, 1)))
 
 build_contour_template(FILES["body_contour"], body_back_cutters, "Template_BodyShell_Back", (0.85, 0.40, 0.85), body_translation)
+
+# ==========================================
+# --- 9.4 STRUCTURAL CORE SIDE TEMPLATE ----
+# ==========================================
+
+try:
+    z_side_template_base = -60.0  # Z elevation offset matching other flat templates
+    y_side_template_offset = -120.0 * side_multiplier  # Shift Y position away from central axis
+    
+    if 'structural_core' in locals() and structural_core and not structural_core.isNull():
+        # 1. Bounding dimensions of the structural core
+        core_bbox = structural_core.BoundBox
+        x_min_core = core_bbox.XMin
+        x_max_core = core_bbox.XMax
+        z_min_core = core_bbox.ZMin
+
+        # 2. Construct 2D Side Profile Wire in local XY space (X -> X, Y -> Z elevation)
+        # This guarantees Part.Face() succeeds without Null shape errors
+        side_profile_2d_points = [
+            App.Vector(x_min_core, z_min_core, 0.0),                     # Bottom rear bridge block corner
+            App.Vector(bridge_start_x, z_bridge_bottom, 0.0),           # Bridge anchor bottom face
+            App.Vector(neck_stop_x, z_bridge_bottom, 0.0),              # Heel bottom step
+            App.Vector(neck_stop_x, z_neck_top - thickness_heel, 0.0),  # Heel transition curve start
+            App.Vector(span_end_x, z_neck_top - 17.0, 0.0),             # Nut bottom line
+            App.Vector(x_volute_end, z_neck_top - 17.0, 0.0),           # Volute transition
+            App.Vector(x_max_core, z_neck_top - 17.0, 0.0),             # Headstock tip bottom
+            App.Vector(x_max_core, z_neck_top, 0.0),                    # Headstock tip top
+            App.Vector(span_end_x, z_neck_top, 0.0),                    # Nut top surface
+            App.Vector(neck_stop_x, z_neck_top, 0.0),                   # Heel top step (Z = 17mm)
+            App.Vector(neck_stop_x, z_step_interface, 0.0),             # Core step drop (Z = 13mm)
+            App.Vector(bridge_start_x, z_step_interface, 0.0),          # Bridge block top face
+            App.Vector(x_min_core, z_step_interface, 0.0),              # Rear tail top face
+            App.Vector(x_min_core, z_min_core, 0.0)                     # Close loop
+        ]
+
+        # 3. Create Face and Extrude 12mm template thickness
+        side_wire_2d = Part.makePolygon(side_profile_2d_points)
+        side_face_2d = Part.Face(side_wire_2d)
+        side_template_solid = side_face_2d.extrude(App.Vector(0, 0, template_thickness))
+
+        # 4. Transform solid into XZ space: rotate -90 degrees around X-axis
+        rot_xz = App.Rotation(App.Vector(1, 0, 0), -90.0)
+        side_template_solid.transformShape(App.Placement(App.Vector(0, 0, 0), rot_xz).toMatrix())
+
+        # 5. Position template to side offset location
+        side_template_solid.translate(App.Vector(0, y_side_template_offset, 0))
+
+        # 6. Drill Reference Pilot Holes (3.0mm dia) for indexing
+        side_pilots = [
+            # Bridge Center alignment pilot
+            Part.makeCylinder(1.5, 50.0, App.Vector(0.0, y_side_template_offset - 5.0, (z_step_interface + z_bridge_bottom) / 2.0), App.Vector(0, 1, 0)),
+            # Heel Interface alignment pilot (X = 211mm)
+            Part.makeCylinder(1.5, 50.0, App.Vector(neck_stop_x, y_side_template_offset - 5.0, (z_neck_top + z_bridge_bottom) / 2.0), App.Vector(0, 1, 0)),
+            # Scale Nut Line alignment pilot (X = 864mm)
+            Part.makeCylinder(1.5, 50.0, App.Vector(span_end_x, y_side_template_offset - 5.0, z_neck_top - 8.5), App.Vector(0, 1, 0))
+        ]
+
+        side_template_solid = side_template_solid.cut(Part.makeCompound(side_pilots))
+
+        # 7. Instantiate Feature Object
+        feat_side = doc.addObject("Part::Feature", "Template_StructuralCore_Side")
+        feat_side.Shape = side_template_solid
+        feat_side.ViewObject.ShapeColor = (0.30, 0.85, 0.60)
+        feat_side.ViewObject.Transparency = 20
+        feat_side.Label = "Template_StructuralCore_Side"
+        
+        App.Console.PrintMessage("Successfully generated Structural Core Side Profile Template.\n")
+
+except Exception as side_t_err:
+    App.Console.PrintError(f"Failed Structural Core Side template generation: {str(side_t_err)}\n")
 
 # ==========================================
 # --- 10. ERGONOMIC ANGLED WEDGE SLEDS ----
